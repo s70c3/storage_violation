@@ -1,0 +1,126 @@
+import cv2
+import json
+import requests
+
+
+API_URL = "http://127.0.0.1:8000"
+CAMERA_ID = "cam_1"
+
+IDEAL_IMAGE_PATH = "data/ideal.png"
+VIDEO_PATH = "data/video1.avi"
+
+# Можно поставить None, если полигон не нужен
+POLYGONS = None
+# Отправлять не каждый кадр, а, например, каждый 3-й
+SEND_EVERY_N_FRAMES = 5
+
+# Таймаут запроса
+REQUEST_TIMEOUT = 60
+
+
+def upload_ideal(api_url: str, camera_id: str, ideal_path: str) -> None:
+    with open(ideal_path, "rb") as f:
+        resp = requests.post(
+            f"{api_url}/ideal/{camera_id}",
+            files={"image": (ideal_path, f, "image/jpeg")},
+            timeout=REQUEST_TIMEOUT,
+        )
+    print("UPLOAD IDEAL:", resp.status_code, resp.text)
+    resp.raise_for_status()
+
+
+def send_frame(api_url: str, camera_id: str, frame_bgr, polygons=None):
+    ok, encoded = cv2.imencode(".jpg", frame_bgr)
+    if not ok:
+        raise RuntimeError("Failed to encode frame to JPEG")
+
+    data = {"camera_id": camera_id}
+    if polygons is not None:
+        data["polygons"] = json.dumps(polygons)
+
+    files = {
+        "frame": ("frame.jpg", encoded.tobytes(), "image/jpeg"),
+    }
+
+    resp = requests.post(
+        f"{api_url}/process_frame",
+        data=data,
+        files=files,
+        timeout=REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def draw_result(frame_bgr, result: dict):
+    vis = frame_bgr.copy()
+
+    boxes = result.get("boxes", [])
+    status = bool(result.get("status", False))
+    detected = bool(result.get("detected", False))
+    debug = result.get("debug", {})
+
+    for box in boxes:
+        x1, y1, x2, y2 = map(int, box)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 255), 2)
+
+    text1 = f"detected={detected} status={status} boxes={len(boxes)}"
+    text2 = (
+        f"n_inst={debug.get('n_instances', 0)} "
+        f"ready={debug.get('ready_len', 0)} "
+        f"alpha={debug.get('alpha_used', 0)}"
+    )
+
+    cv2.putText(vis, text1, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(vis, text2, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+
+    return vis
+
+
+def main():
+    upload_ideal(API_URL, CAMERA_ID, IDEAL_IMAGE_PATH)
+
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {VIDEO_PATH}")
+
+    frame_idx = 0
+    last_result = {
+        "detected": False,
+        "status": False,
+        "boxes": [],
+        "debug": {},
+    }
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        frame_idx += 1
+
+        if frame_idx % SEND_EVERY_N_FRAMES == 0:
+            try:
+                last_result = send_frame(
+                    api_url=API_URL,
+                    camera_id=CAMERA_ID,
+                    frame_bgr=frame,
+                    polygons=POLYGONS,
+                )
+                print(f"frame={frame_idx} -> {last_result}")
+            except requests.RequestException as e:
+                print(f"Request failed on frame {frame_idx}: {e}")
+
+        vis = draw_result(frame, last_result)
+        cv2.imshow("Storage Violation Client", vis)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27 or key == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

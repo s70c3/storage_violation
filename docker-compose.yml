@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  storage-violation-api:
+    build: .
+    container_name: storage-violation-api
+    ports:
+      - "8000:8000"
+    environment:
+      PYTHONUNBUFFERED: "1"
+    restart: unless-stopped
