@@ -16,7 +16,8 @@ FastAPI-сервис для обнаружения нарушений хране
 git clone https://github.com/s70c3/storage_violation.git
 cd storage_violation
 ```
-2. Запустить сервис
+2. Скачать [веса](https://disk.yandex.ru/d/0VSHkaiwtgwjZQ) и поместить в папку weights. 
+3. Запустить сервис
 ```
 docker compose up --build
 ```
@@ -39,4 +40,4 @@ http://localhost:8000/docs
 Файл `process_video.py` содержит тестовый скрипт, который позволяет проверить на видео. 
 
 
-_NB! сейчас всё конфигурировано  для cpu и может работать медленно._ 
+_NB! сейчас всё конфигурировано для cpu и может работать медленно._ 
