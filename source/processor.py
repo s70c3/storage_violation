@@ -35,9 +35,10 @@ class StorageViolationFrameProcessor:
     Main public method:
         process_frame(camera_id, frame_bgr, ideal_bgr, polygons=None, frame_obj=None)
 
-    Notes:
-    - This version keeps the OLD external API,
-      but internally follows the NEW pipeline logic.
+    Returns:
+        - candidate_boxes: red boxes, current candidates from queue snapshot
+        - reported_boxes: green boxes, confirmed abandoned objects
+        - boxes: alias of reported_boxes for backward compatibility
     """
 
     def __init__(
@@ -45,26 +46,21 @@ class StorageViolationFrameProcessor:
         cd_segmentator: SemanticSegmentatorProtocol,
         delta: int = 10,
 
-        # EMA config
         ema_tau_sec: float = 5.0,
         ema_min_alpha: float = 0.02,
         ema_max_alpha: float = 0.12,
 
-        # Weight of ideal frame in recent-for-cd
         min_empty_weight: float = 0.20,
 
-        # Instance extraction
         thr: float = 0.5,
         min_side: int = 100,
         morph_ksize: int = 3,
 
-        # Candidate queue
         threshold_hits: int = 10,
         threshold_time_sec: float = 5.0,
         expiration_time_sec: float = 30.0,
         drop_reported: bool = False,
 
-        # Association params
         pad_factor: float = 0.2,
         min_bbox_iou_gate: float = 0.3,
         min_mask_iou: float = 0.6,
@@ -72,11 +68,9 @@ class StorageViolationFrameProcessor:
         w_centroid: float = 0.3,
         w_mask: float = 0.2,
 
-        # Tiling control
         tile_split_long_side: int = 5000,
         tile_overlap: int = 64,
 
-        # recent update decimation
         recent_update_every: int = 10,
 
         logger: logging.Logger | None = None,
@@ -127,10 +121,6 @@ class StorageViolationFrameProcessor:
         threshold_time_sec: float | None = None,
         min_side: int | None = None,
     ):
-        """
-        Update runtime parameters affecting candidate filtering.
-        Existing camera queues will be recreated.
-        """
         if threshold_hits is not None:
             self.threshold_hits = int(threshold_hits)
 
@@ -169,6 +159,7 @@ class StorageViolationFrameProcessor:
             threshold_hits=self.threshold_hits,
             threshold_time_sec=self.threshold_time_sec,
             expiration_time_sec=self.expiration_time_sec,
+            drop_reported=self.drop_reported,
             pad_factor=self.pad_factor,
             min_bbox_iou_gate=self.min_bbox_iou_gate,
             min_mask_iou=self.min_mask_iou,
@@ -199,11 +190,6 @@ class StorageViolationFrameProcessor:
     @staticmethod
     def _bgr_u8_to_rgb01(bgr_u8: np.ndarray) -> np.ndarray:
         return bgr_u8[..., ::-1].astype(np.float32) / 255.0
-
-    @staticmethod
-    def _rgb01_to_bgr_u8(rgb01: np.ndarray) -> np.ndarray:
-        rgb01 = np.clip(rgb01, 0.0, 1.0)
-        return (rgb01[..., ::-1] * 255.0).astype(np.uint8)
 
     @staticmethod
     def _fit_rgb01_to_hw(rgb01: np.ndarray, target_hw: Tuple[int, int]) -> np.ndarray:
@@ -251,10 +237,7 @@ class StorageViolationFrameProcessor:
         m = np.ascontiguousarray(m)
 
         if self.morph_ksize > 0:
-            k = cv2.getStructuringElement(
-                cv2.MORPH_RECT,
-                (self.morph_ksize, self.morph_ksize),
-            )
+            k = cv2.getStructuringElement(cv2.MORPH_RECT, (self.morph_ksize, self.morph_ksize))
             m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
             m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
 
@@ -285,6 +268,20 @@ class StorageViolationFrameProcessor:
         y_min, x_min = coords.min(axis=0)
         y_max, x_max = coords.max(axis=0)
         return np.array([x_min, y_min, x_max, y_max], dtype=np.float32)
+
+    @staticmethod
+    def _extract_candidate_boxes(candidates: List[Any]) -> np.ndarray:
+        if not candidates:
+            return np.empty((0, 4), dtype=np.int32)
+        boxes = []
+        for c in candidates:
+            bbox = getattr(c, "bbox", None)
+            if bbox is None:
+                continue
+            boxes.append(np.asarray(bbox, dtype=np.int32))
+        if not boxes:
+            return np.empty((0, 4), dtype=np.int32)
+        return np.stack(boxes, axis=0)
 
     def _build_cd_tensor_1x9(
         self,
@@ -407,13 +404,6 @@ class StorageViolationFrameProcessor:
 
         return out
 
-    def _queue_step(self, camera_id: str, now_mono: float, inst_masks: List[np.ndarray]):
-        self._ensure_camera_queue(camera_id)
-        cq = self.queue_by_camera[camera_id]
-        bboxes = [self._get_bbox(m) for m in inst_masks]
-        snap, ready = cq.step(now=now_mono, current_masks=inst_masks, current_bboxes=bboxes)
-        return snap, ready, bboxes
-
     def _init_camera_state_if_needed(
         self,
         camera_id: str,
@@ -428,8 +418,7 @@ class StorageViolationFrameProcessor:
         empty_rgb01_raw = self._bgr_u8_to_rgb01(ideal_bgr)
         if empty_rgb01_raw.shape[:2] != (h, w):
             self._logger.warning(
-                f"[INIT] camera={camera_id} ideal size={empty_rgb01_raw.shape[:2]} "
-                f"!= frame size={(h, w)}; using resize"
+                f"[INIT] camera={camera_id} ideal size={empty_rgb01_raw.shape[:2]} != frame size={(h, w)}; using resize"
             )
 
         empty_rgb01 = self._fit_rgb01_to_hw(empty_rgb01_raw, (h, w))
@@ -443,7 +432,6 @@ class StorageViolationFrameProcessor:
             recent_frame_i=0,
             recent_dt_accum=0.0,
         )
-
         self._logger.info(f"[INIT] state created for camera={camera_id}")
 
     def _ensure_camera_initialized(
@@ -453,12 +441,7 @@ class StorageViolationFrameProcessor:
         ideal_bgr: np.ndarray,
         now_mono: float,
     ) -> None:
-        self._init_camera_state_if_needed(
-            camera_id=camera_id,
-            frame_hw=frame_hw,
-            ideal_bgr=ideal_bgr,
-            now_mono=now_mono,
-        )
+        self._init_camera_state_if_needed(camera_id, frame_hw, ideal_bgr, now_mono)
         self._ensure_camera_queue(camera_id)
 
     def gamma_rgb01(self, x: np.ndarray, gamma: float = 0.8) -> np.ndarray:
@@ -467,9 +450,7 @@ class StorageViolationFrameProcessor:
 
     @staticmethod
     def _blur_rgb01(rgb01: np.ndarray, ksize: int = 5) -> np.ndarray:
-        if rgb01 is None:
-            return rgb01
-        if ksize <= 1:
+        if rgb01 is None or ksize <= 1:
             return rgb01
         if (ksize % 2) == 0:
             ksize += 1
@@ -508,17 +489,15 @@ class StorageViolationFrameProcessor:
         zone_mask_u8 = self._build_zone_mask_u8((h, w), polygons, frame_obj=frame_obj)
         zone_bool = zone_mask_u8 > 0
 
-        alpha_used = self._update_recent(
-            st=st,
-            cur_rgb01=cur_rgb01,
-            now_mono=now_mono,
-        )
+        alpha_used = self._update_recent(st=st, cur_rgb01=cur_rgb01, now_mono=now_mono)
 
         if not self._should_detect(st, now_mono):
             return {
                 "detected": False,
                 "status": False,
                 "boxes": np.empty((0, 4), dtype=np.int32),
+                "candidate_boxes": np.empty((0, 4), dtype=np.int32),
+                "reported_boxes": np.empty((0, 4), dtype=np.int32),
                 "instance_masks": [],
                 "cd_mask01": None,
                 "fused_mask01": None,
@@ -570,46 +549,26 @@ class StorageViolationFrameProcessor:
 
         inst_masks = self._mask01_to_instances(fused01)
 
-        snap, ready, _ = self._queue_step(
-            camera_id=camera_id,
-            now_mono=now_mono,
-            inst_masks=inst_masks,
-        )
+        cq = self.queue_by_camera[camera_id]
+        bboxes = [self._get_bbox(m) for m in inst_masks]
+        snap, ready = cq.step(now=now_mono, current_masks=inst_masks, current_bboxes=bboxes)
+
+        candidate_boxes = self._extract_candidate_boxes(snap)
+        reported_boxes = self._extract_candidate_boxes(ready)
 
         self._logger.info(
-            f"[QUEUE] camera={camera_id} snapshot={len(snap)}, ready={len(ready)}, "
-            f"threshold_hits={self.threshold_hits}"
+            f"[QUEUE] camera={camera_id} snapshot={len(snap)}, ready={len(ready)}, threshold_hits={self.threshold_hits}"
         )
 
-        if not ready:
-            return {
-                "detected": True,
-                "status": False,
-                "boxes": np.empty((0, 4), dtype=np.int32),
-                "instance_masks": inst_masks,
-                "cd_mask01": cd_mask01,
-                "fused_mask01": fused01,
-                "debug": {
-                    "camera_id": camera_id,
-                    "alpha_used": alpha_used,
-                    "detect_started": st.detect_started,
-                    "n_instances": len(inst_masks),
-                    "snapshot_len": len(snap),
-                    "ready_len": len(ready),
-                    "skipped_by_delta": False,
-                },
-            }
-
-        out_boxes = np.array([c.bbox for c in ready], dtype=np.int32)
-
-        cq = self.queue_by_camera[camera_id]
-        if hasattr(cq, "on_report"):
+        if len(ready) > 0 and hasattr(cq, "on_report"):
             cq.on_report([c.cand_id for c in ready])
 
         return {
             "detected": True,
-            "status": True,
-            "boxes": out_boxes,
+            "status": len(ready) > 0,
+            "boxes": reported_boxes,          # backward compatibility
+            "candidate_boxes": candidate_boxes,
+            "reported_boxes": reported_boxes,
             "instance_masks": inst_masks,
             "cd_mask01": cd_mask01,
             "fused_mask01": fused01,

@@ -55,24 +55,55 @@ def send_frame(api_url: str, camera_id: str, frame_bgr, polygons=None):
 def draw_result(frame_bgr, result: dict):
     vis = frame_bgr.copy()
 
-    boxes = result.get("boxes", [])
     status = bool(result.get("status", False))
     detected = bool(result.get("detected", False))
     debug = result.get("debug", {})
 
-    for box in boxes:
+    candidate_boxes = result.get("candidate_boxes", [])
+    reported_boxes = result.get("reported_boxes", result.get("boxes", []))
+
+    # Красные: кандидаты
+    for box in candidate_boxes:
         x1, y1, x2, y2 = map(int, box)
         cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        cv2.putText(
+            vis,
+            "candidate",
+            (x1, max(20, y1 - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
-    text1 = f"detected={detected} status={status} boxes={len(boxes)}"
+    # Зеленые: подтвержденные оставленные
+    for box in reported_boxes:
+        x1, y1, x2, y2 = map(int, box)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        cv2.putText(
+            vis,
+            "reported",
+            (x1, max(20, y1 - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+    text1 = (
+        f"detected={detected} status={status} "
+        f"cand={len(candidate_boxes)} reported={len(reported_boxes)}"
+    )
     text2 = (
         f"n_inst={debug.get('n_instances', 0)} "
         f"ready={debug.get('ready_len', 0)} "
-        f"alpha={debug.get('alpha_used', 0)}"
+        f"alpha={debug.get('alpha_used', 0):.4f}"
     )
 
-    cv2.putText(vis, text1, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
-    cv2.putText(vis, text2, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(vis, text1, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(vis, text2, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2, cv2.LINE_AA)
 
     return vis
 
