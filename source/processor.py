@@ -191,11 +191,6 @@ class StorageViolationFrameProcessor:
     def _bgr_u8_to_rgb01(bgr_u8: np.ndarray) -> np.ndarray:
         return bgr_u8[..., ::-1].astype(np.float32) / 255.0
 
-    @staticmethod
-    def _fit_rgb01_to_hw(rgb01: np.ndarray, target_hw: Tuple[int, int]) -> np.ndarray:
-        th, tw = target_hw
-        return cv2.resize(rgb01, (tw, th), interpolation=cv2.INTER_LINEAR).astype(np.float32)
-
     def _build_zone_mask_u8(
         self,
         image_hw: Tuple[int, int],
@@ -415,13 +410,12 @@ class StorageViolationFrameProcessor:
             return
 
         h, w = frame_hw
-        empty_rgb01_raw = self._bgr_u8_to_rgb01(ideal_bgr)
-        if empty_rgb01_raw.shape[:2] != (h, w):
+        empty_rgb01 = self._bgr_u8_to_rgb01(ideal_bgr)
+        if empty_rgb01.shape[:2] != (h, w):
             self._logger.warning(
-                f"[INIT] camera={camera_id} ideal size={empty_rgb01_raw.shape[:2]} != frame size={(h, w)}; using resize"
+                f"[INIT] camera={camera_id} ideal size={empty_rgb01.shape[:2]} != frame size={(h, w)}; using resize"
             )
 
-        empty_rgb01 = self._fit_rgb01_to_hw(empty_rgb01_raw, (h, w))
 
         self.camera_state[camera_id] = CameraEMAState(
             empty_rgb01=empty_rgb01,
