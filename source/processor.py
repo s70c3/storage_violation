@@ -108,7 +108,7 @@ class StorageViolationFrameProcessor:
         self.tile_overlap = int(max(0, tile_overlap))
 
         self.recent_update_every = max(1, int(recent_update_every))
-
+        self._rt_iter_by_camera: Dict[str, int] = {}
         self._logger = logger or logging.getLogger("StorageViolationProcessor")
         if not self._logger.handlers:
             logging.basicConfig(level=logging.INFO)
