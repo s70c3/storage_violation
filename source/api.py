@@ -20,7 +20,7 @@ if not LOGGER.handlers:
 
 
 MODEL_WEIGHTS_PATH = "weights/cd_weights.pt"
-MODEL_DEVICE = "cpu"   # e.g. "cuda:0"
+MODEL_DEVICE = "cuda:0"   # e.g. "cuda:0"
 MODEL_THRESHOLD = 0.5
 MODEL_HALF = False
 MODEL_INP_CH = 9
