@@ -465,7 +465,8 @@ class StorageViolationFrameProcessor:
             inst_bboxes: List[np.ndarray],
     ) -> None:
         try:
-            self._rt_dir.mkdir(parents=True, exist_ok=True)
+            rt_dir = Path("/tmp/rt_tests")
+            rt_dir.mkdir(parents=True, exist_ok=True)
 
             ideal_bgr = self._rgb01_to_bgr_u8(empty_rgb01)
             recent_bgr = self._rgb01_to_bgr_u8(recent_rgb01)
@@ -567,7 +568,7 @@ class StorageViolationFrameProcessor:
             it = self._rt_iter_by_camera.get(camera_id, 0) + 1
             self._rt_iter_by_camera[camera_id] = it
             ts_ms = int(time.time() * 1000)
-            out_path = self._rt_dir / f"cam_{camera_id}_it_{it:06d}_{ts_ms}.jpg"
+            out_path = rt_dir / f"cam_{camera_id}_it_{it:06d}_{ts_ms}.jpg"
 
             ok = cv2.imwrite(str(out_path), panel)
             if not ok:
