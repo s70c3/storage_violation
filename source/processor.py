@@ -112,7 +112,7 @@ class StorageViolationFrameProcessor:
         self.tile_split_long_side = int(tile_split_long_side)
         self.tile_overlap = int(max(0, tile_overlap))
 
-        self.recent_update_every = int(recent_update_every)
+        self.recent_update_every = max(1, int(recent_update_every))
 
         self._logger = logger or logging.getLogger("StorageViolationProcessor")
         if not self._logger.handlers:
@@ -147,19 +147,7 @@ class StorageViolationFrameProcessor:
         )
 
         for camera_id in list(self.queue_by_camera.keys()):
-            self.queue_by_camera[camera_id] = CandidateQueueManager(
-                threshold_hits=self.threshold_hits,
-                threshold_time_sec=self.threshold_time_sec,
-                expiration_time_sec=self.expiration_time_sec,
-                drop_reported=self.drop_reported,
-                pad_factor=self.pad_factor,
-                min_bbox_iou_gate=self.min_bbox_iou_gate,
-                min_mask_iou=self.min_mask_iou,
-                w_bbox=self.w_bbox,
-                w_centroid=self.w_centroid,
-                w_mask=self.w_mask,
-                logger=self._logger,
-            )
+            self.queue_by_camera[camera_id] = self._make_queue_manager()
             self._logger.info(f"[PARAM_UPDATE] queue reset for camera={camera_id}")
 
     def load(self) -> None:
@@ -172,8 +160,29 @@ class StorageViolationFrameProcessor:
         self.queue_by_camera.clear()
 
     def reset_camera(self, camera_id: str) -> None:
-        self.camera_state.pop(str(camera_id), None)
-        self.queue_by_camera.pop(str(camera_id), None)
+        camera_id = str(camera_id)
+        self.camera_state.pop(camera_id, None)
+        self.queue_by_camera.pop(camera_id, None)
+
+    def _make_queue_manager(self) -> CandidateQueueManager:
+        return CandidateQueueManager(
+            threshold_hits=self.threshold_hits,
+            threshold_time_sec=self.threshold_time_sec,
+            expiration_time_sec=self.expiration_time_sec,
+            drop_reported=self.drop_reported,
+            pad_factor=self.pad_factor,
+            min_bbox_iou_gate=self.min_bbox_iou_gate,
+            min_mask_iou=self.min_mask_iou,
+            w_bbox=self.w_bbox,
+            w_centroid=self.w_centroid,
+            w_mask=self.w_mask,
+            logger=self._logger,
+        )
+
+    def _ensure_camera_queue(self, camera_id: str) -> None:
+        if camera_id not in self.queue_by_camera:
+            self.queue_by_camera[camera_id] = self._make_queue_manager()
+            self._logger.info(f"[INIT] queue created for camera={camera_id}")
 
     def _should_detect(self, st: CameraEMAState, now_mono: float) -> bool:
         if (now_mono - st.last_detect_mono) >= float(self.delta):
@@ -213,12 +222,15 @@ class StorageViolationFrameProcessor:
 
         if polygons:
             for polygon in polygons:
-                pts = np.asarray(polygon, dtype=np.int32).reshape((-1, 1, 2))
+                pts = np.asarray(polygon, dtype=np.int32)
+                if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) < 3:
+                    self._logger.warning(f"[ZONE] skip invalid polygon with shape={pts.shape}")
+                    continue
+                pts = pts.reshape((-1, 1, 2))
                 cv2.fillPoly(zone_mask, [pts], 255)
         else:
             zone_mask[:, :] = 255
 
-        # Compatible with new pipeline: exclude human boxes if frame_obj is available
         if frame_obj is not None:
             raw_humans = getattr(frame_obj, "raw_humans", None)
             raw_human_boxes = getattr(raw_humans, "boxes", None) if raw_humans is not None else None
@@ -245,7 +257,7 @@ class StorageViolationFrameProcessor:
                 (self.morph_ksize, self.morph_ksize),
             )
             m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
-            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k * 2)
+            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
 
         cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -344,7 +356,6 @@ class StorageViolationFrameProcessor:
                     return np.zeros(exp_hw, np.float32)
                 return sem01
 
-            # Fallback: old callable style
             cd_res = self.cd_segmentator([x], {"camera_id": camera_id})
             if not cd_res:
                 return np.zeros((c_tile.shape[0], c_tile.shape[1]), np.float32)
@@ -398,12 +409,13 @@ class StorageViolationFrameProcessor:
         return out
 
     def _queue_step(self, camera_id: str, now_mono: float, inst_masks: List[np.ndarray]):
+        self._ensure_camera_queue(camera_id)
         cq = self.queue_by_camera[camera_id]
         bboxes = [self._get_bbox(m) for m in inst_masks]
         snap, ready = cq.step(now=now_mono, current_masks=inst_masks, current_bboxes=bboxes)
         return snap, ready, bboxes
 
-    def _init_camera_if_needed(
+    def _init_camera_state_if_needed(
         self,
         camera_id: str,
         frame_hw: Tuple[int, int],
@@ -433,21 +445,25 @@ class StorageViolationFrameProcessor:
             recent_dt_accum=0.0,
         )
 
-        self.queue_by_camera[camera_id] = CandidateQueueManager(
-            threshold_hits=self.threshold_hits,
-            threshold_time_sec=self.threshold_time_sec,
-            expiration_time_sec=self.expiration_time_sec,
-            drop_reported=self.drop_reported,
-            pad_factor=self.pad_factor,
-            min_bbox_iou_gate=self.min_bbox_iou_gate,
-            min_mask_iou=self.min_mask_iou,
-            w_bbox=self.w_bbox,
-            w_centroid=self.w_centroid,
-            w_mask=self.w_mask,
-            logger=self._logger,
+        self._logger.info(f"[INIT] state created for camera={camera_id}")
+
+    def _ensure_camera_initialized(
+        self,
+        camera_id: str,
+        frame_hw: Tuple[int, int],
+        ideal_bgr: np.ndarray,
+        now_mono: float,
+    ) -> None:
+        self._init_camera_state_if_needed(
+            camera_id=camera_id,
+            frame_hw=frame_hw,
+            ideal_bgr=ideal_bgr,
+            now_mono=now_mono,
         )
+        self._ensure_camera_queue(camera_id)
 
     def gamma_rgb01(self, x: np.ndarray, gamma: float = 0.8) -> np.ndarray:
+        x = np.clip(x, 0.0, 1.0)
         return np.power(x, gamma).astype(np.float32)
 
     @staticmethod
@@ -456,6 +472,8 @@ class StorageViolationFrameProcessor:
             return rgb01
         if ksize <= 1:
             return rgb01
+        if (ksize % 2) == 0:
+            ksize += 1
         return cv2.GaussianBlur(rgb01, (ksize, ksize), 0)
 
     def process_frame(
@@ -467,15 +485,25 @@ class StorageViolationFrameProcessor:
         now_mono: Optional[float] = None,
         frame_obj: Any = None,
     ) -> dict:
+        if frame_bgr is None:
+            raise ValueError("frame_bgr is None")
+        if ideal_bgr is None:
+            raise ValueError("ideal_bgr is None")
+
         if now_mono is None:
             now_mono = time.monotonic()
 
         camera_id = str(camera_id)
-        cur_bgr = frame_bgr
+        cur_bgr = np.ascontiguousarray(frame_bgr)
         h, w = cur_bgr.shape[:2]
         cur_rgb01 = self._bgr_u8_to_rgb01(cur_bgr)
 
-        self._init_camera_if_needed(camera_id, (h, w), ideal_bgr, now_mono)
+        self._ensure_camera_initialized(
+            camera_id=camera_id,
+            frame_hw=(h, w),
+            ideal_bgr=ideal_bgr,
+            now_mono=now_mono,
+        )
         st = self.camera_state[camera_id]
 
         zone_mask_u8 = self._build_zone_mask_u8((h, w), polygons, frame_obj=frame_obj)
@@ -511,7 +539,6 @@ class StorageViolationFrameProcessor:
             + self.min_empty_weight * st.empty_rgb01
         )
 
-        # Preprocess as in the new pipeline
         empty_rgb01 = self.gamma_rgb01(st.empty_rgb01, 0.8)
         empty_rgb01 = self._blur_rgb01(empty_rgb01, ksize=13)
 
@@ -536,10 +563,10 @@ class StorageViolationFrameProcessor:
             st.detect_started = True
 
         fused01 = cd_mask01.copy()
-        fused01 *= zone_bool
+        fused01 *= zone_bool.astype(np.float32)
 
         self._logger.info(
-            f"[FUSE] cd_sum={cd_mask01.sum():.1f}, fused_sum={fused01.sum():.1f}"
+            f"[FUSE] camera={camera_id} cd_sum={cd_mask01.sum():.1f}, fused_sum={fused01.sum():.1f}"
         )
 
         inst_masks = self._mask01_to_instances(fused01)
@@ -551,7 +578,8 @@ class StorageViolationFrameProcessor:
         )
 
         self._logger.info(
-            f"[QUEUE] snapshot={len(snap)}, ready={len(ready)}, threshold_hits={self.threshold_hits}"
+            f"[QUEUE] camera={camera_id} snapshot={len(snap)}, ready={len(ready)}, "
+            f"threshold_hits={self.threshold_hits}"
         )
 
         if not ready:
