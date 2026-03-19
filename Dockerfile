@@ -1,23 +1,23 @@
-FROM python:3.11-slim
+FROM nvcr.io/nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV PIP_NO_CACHE_DIR=1
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED 1
+
+RUN apt-get update -y
+RUN DEBIAN_FRONTEND=noninteractive apt-get install -y git python3-pip cmake gcc curl iputils-ping
+
+RUN pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libsm6 libxext6
 
 WORKDIR /app
+ENV PYTHONPATH=/app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 \
-    libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip && pip install -r /app/requirements.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY source /app/storage_violation
 COPY weights /app/weights
 COPY main.py /app/main.py
 
-EXPOSE 8000
-
-CMD ["python", "main.py"]
+CMD ["python3", "main.py"]
