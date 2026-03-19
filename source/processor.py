@@ -649,17 +649,17 @@ class StorageViolationFrameProcessor:
         )
 
         empty_rgb01 = self.gamma_rgb01(st.empty_rgb01, 0.8)
-        empty_rgb01 = self._blur_rgb01(empty_rgb01, ksize=13)
+        empty_rgb01 = self._blur_rgb01(empty_rgb01, ksize=3)
 
         recent_rgb01_for_cd = self.gamma_rgb01(recent_rgb01_for_cd, 0.8)
-        recent_blur = self._blur_rgb01(recent_rgb01_for_cd, ksize=21)
+        recent_blur = self._blur_rgb01(recent_rgb01_for_cd, ksize=15)
         recent_rgb01_for_cd = (
             (1.0 - self.min_empty_weight) * recent_blur
             + self.min_empty_weight * st.empty_rgb01
         )
 
         cur_rgb01_proc = self.gamma_rgb01(cur_rgb01, 0.8)
-        cur_rgb01_proc = self._blur_rgb01(cur_rgb01_proc, ksize=13)
+        cur_rgb01_proc = self._blur_rgb01(cur_rgb01_proc, ksize=3)
 
 
         cd_mask01 = self._infer_cd_mask01(
