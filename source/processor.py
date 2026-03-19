@@ -461,6 +461,15 @@ class StorageViolationFrameProcessor:
         rgb01 = np.clip(rgb01, 0.0, 1.0)
         return (rgb01[..., ::-1] * 255.0).astype(np.uint8)
 
+
+    @staticmethod
+    def _mask01_to_bgr_u8(mask01: np.ndarray) -> np.ndarray:
+        if mask01 is None:
+            return np.zeros((1, 1, 3), np.uint8)
+        m = np.clip(mask01, 0.0, 1.0)
+        m_u8 = (m * 255.0).astype(np.uint8)
+        return cv2.cvtColor(m_u8, cv2.COLOR_GRAY2BGR)
+
     def _save_rt_panel(
             self,
             camera_id: str,
