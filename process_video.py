@@ -12,7 +12,7 @@ VIDEO_PATH = "data/video1.avi"
 # Можно поставить None, если полигон не нужен
 POLYGONS = None
 # Отправлять не каждый кадр, а, например, каждый 3-й
-SEND_EVERY_N_FRAMES = 5
+SEND_EVERY_N_FRAMES = 1
 
 # Таймаут запроса
 REQUEST_TIMEOUT = 60
