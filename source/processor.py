@@ -456,6 +456,11 @@ class StorageViolationFrameProcessor:
             ksize += 1
         return cv2.GaussianBlur(rgb01, (ksize, ksize), 0)
 
+    @staticmethod
+    def _rgb01_to_bgr_u8(rgb01: np.ndarray) -> np.ndarray:
+        rgb01 = np.clip(rgb01, 0.0, 1.0)
+        return (rgb01[..., ::-1] * 255.0).astype(np.uint8)
+
     def _save_rt_panel(
             self,
             camera_id: str,
