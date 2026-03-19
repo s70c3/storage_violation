@@ -76,13 +76,27 @@ def draw_result(frame_bgr, result: dict):
 
     return vis
 
-
 def main():
     upload_ideal(API_URL, CAMERA_ID, IDEAL_IMAGE_PATH)
 
     cap = cv2.VideoCapture(VIDEO_PATH)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {VIDEO_PATH}")
+
+    # --- параметры видео ---
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 25  # fallback
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    output_path = "output.mp4"
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    print(f"[INFO] Writing result video to: {output_path}")
 
     frame_idx = 0
     last_result = {
@@ -112,15 +126,14 @@ def main():
                 print(f"Request failed on frame {frame_idx}: {e}")
 
         vis = draw_result(frame, last_result)
-        cv2.imshow("Storage Violation Client", vis)
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == 27 or key == ord("q"):
-            break
+        # --- запись вместо показа ---
+        writer.write(vis)
 
     cap.release()
-    cv2.destroyAllWindows()
+    writer.release()
 
+    print("[INFO] Done. Video saved.")
 
 if __name__ == "__main__":
     main()
