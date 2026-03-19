@@ -159,7 +159,6 @@ class StorageViolationFrameProcessor:
             threshold_hits=self.threshold_hits,
             threshold_time_sec=self.threshold_time_sec,
             expiration_time_sec=self.expiration_time_sec,
-            drop_reported=self.drop_reported,
             pad_factor=self.pad_factor,
             min_bbox_iou_gate=self.min_bbox_iou_gate,
             min_mask_iou=self.min_mask_iou,
