@@ -13,6 +13,7 @@ import torch
 from .queue_manager import CandidateQueueManager
 from .segmentator import SemanticSegmentatorProtocol
 
+from pathlib import Path
 
 @dataclass
 class CameraEMAState:
