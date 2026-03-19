@@ -44,7 +44,7 @@ class StorageViolationFrameProcessor:
     def __init__(
         self,
         cd_segmentator: SemanticSegmentatorProtocol,
-        delta: int = 10,
+        delta: int = 0,
 
         ema_tau_sec: float = 5.0,
         ema_min_alpha: float = 0.02,
