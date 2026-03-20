@@ -183,51 +183,6 @@ class StorageViolationFrameProcessor:
             interpolation=cv2.INTER_LINEAR,
         ).astype(np.float32, copy=False)
 
-    def _resize_triplet_for_model(
-        self,
-        empty_rgb01: np.ndarray,
-        recent_rgb01: np.ndarray,
-        cur_rgb01: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int], float]:
-        """
-        Приводит empty/recent к размеру cur.
-        Если длинная сторона cur больше max_long_side, уменьшает все 3 изображения
-        только для модели. Возвращает:
-            empty_model, recent_model, cur_model, orig_hw, resize_scale
-        """
-        orig_hw = cur_rgb01.shape[:2]
-
-        empty_rgb01 = self._resize_rgb01_to_hw(empty_rgb01, orig_hw)
-        recent_rgb01 = self._resize_rgb01_to_hw(recent_rgb01, orig_hw)
-
-        h, w = orig_hw
-        long_side = max(h, w)
-
-        if long_side <= self.max_long_side:
-            return (
-                empty_rgb01.astype(np.float32, copy=False),
-                recent_rgb01.astype(np.float32, copy=False),
-                cur_rgb01.astype(np.float32, copy=False),
-                orig_hw,
-                1.0,
-            )
-
-        scale = float(self.max_long_side) / float(long_side)
-        new_w = max(1, int(round(w * scale)))
-        new_h = max(1, int(round(h * scale)))
-
-        empty_small = cv2.resize(
-            empty_rgb01, (new_w, new_h), interpolation=cv2.INTER_AREA
-        ).astype(np.float32, copy=False)
-        recent_small = cv2.resize(
-            recent_rgb01, (new_w, new_h), interpolation=cv2.INTER_AREA
-        ).astype(np.float32, copy=False)
-        cur_small = cv2.resize(
-            cur_rgb01, (new_w, new_h), interpolation=cv2.INTER_AREA
-        ).astype(np.float32, copy=False)
-
-        return empty_small, recent_small, cur_small, orig_hw, scale
-
     def _build_zone_mask_u8(
         self,
         image_hw: Tuple[int, int],
@@ -269,7 +224,9 @@ class StorageViolationFrameProcessor:
         m = np.ascontiguousarray(m)
 
         if self.morph_ksize > 0:
-            k = cv2.getStructuringElement(cv2.MORPH_RECT, (self.morph_ksize, self.morph_ksize))
+            k = cv2.getStructuringElement(
+                cv2.MORPH_RECT, (self.morph_ksize, self.morph_ksize)
+            )
             m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
             m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
 
@@ -327,6 +284,14 @@ class StorageViolationFrameProcessor:
         dt = now_mono - st.last_ts_mono
         st.last_ts_mono = now_mono
 
+        # Защитная проверка: в норме сюда уже должны приходить совпадающие размеры.
+        if st.recent_rgb01.shape[:2] != cur_rgb01.shape[:2]:
+            self._logger.warning(
+                f"[RECENT_RESIZE] recent_hw={st.recent_rgb01.shape[:2]} "
+                f"-> cur_hw={cur_rgb01.shape[:2]}"
+            )
+            st.recent_rgb01 = self._resize_rgb01_to_hw(st.recent_rgb01, cur_rgb01.shape[:2])
+
         st.recent_frame_i += 1
         st.recent_dt_accum += max(0.0, float(dt))
 
@@ -350,20 +315,34 @@ class StorageViolationFrameProcessor:
         if cur_rgb01.ndim != 3 or cur_rgb01.shape[2] != 3:
             raise ValueError(f"cur_rgb01 must be HxWx3 float32, got {cur_rgb01.shape}")
 
-        empty_model, recent_model, cur_model, orig_hw, resize_scale = self._resize_triplet_for_model(
-            empty_rgb01=empty_rgb01,
-            recent_rgb01=recent_rgb01,
-            cur_rgb01=cur_rgb01,
-        )
+        orig_hw = cur_rgb01.shape[:2]
+        empty_model = empty_rgb01
+        recent_model = recent_rgb01
+        cur_model = cur_rgb01
+        resize_scale = 1.0
 
-        exp_hw_model = cur_model.shape[:2]
+        long_side = max(orig_hw)
+        if long_side > self.max_long_side:
+            resize_scale = float(self.max_long_side) / float(long_side)
+            new_w = max(1, int(round(orig_hw[1] * resize_scale)))
+            new_h = max(1, int(round(orig_hw[0] * resize_scale)))
 
-        if resize_scale != 1.0:
+            empty_model = cv2.resize(
+                empty_rgb01, (new_w, new_h), interpolation=cv2.INTER_AREA
+            ).astype(np.float32, copy=False)
+            recent_model = cv2.resize(
+                recent_rgb01, (new_w, new_h), interpolation=cv2.INTER_AREA
+            ).astype(np.float32, copy=False)
+            cur_model = cv2.resize(
+                cur_rgb01, (new_w, new_h), interpolation=cv2.INTER_AREA
+            ).astype(np.float32, copy=False)
+
             self._logger.info(
                 f"[MODEL_RESIZE] camera={camera_id} "
-                f"orig_hw={orig_hw} model_hw={exp_hw_model} scale={resize_scale:.4f}"
+                f"orig_hw={orig_hw} model_hw={cur_model.shape[:2]} scale={resize_scale:.4f}"
             )
 
+        exp_hw_model = cur_model.shape[:2]
         x = self._build_cd_tensor_1x9(empty_model, recent_model, cur_model)
 
         pred_fn = getattr(self.cd_segmentator, "predict_semantic01", None)
@@ -447,6 +426,23 @@ class StorageViolationFrameProcessor:
         self._init_camera_state_if_needed(camera_id, frame_hw, ideal_bgr, now_mono)
         self._ensure_camera_tracker(camera_id)
 
+        st = self.camera_state[camera_id]
+
+        # Приводим state к размеру кадра только при несовпадении.
+        if st.empty_rgb01.shape[:2] != frame_hw:
+            self._logger.warning(
+                f"[STATE_RESIZE] camera={camera_id} "
+                f"empty_hw={st.empty_rgb01.shape[:2]} -> frame_hw={frame_hw}"
+            )
+            st.empty_rgb01 = self._resize_rgb01_to_hw(st.empty_rgb01, frame_hw)
+
+        if st.recent_rgb01.shape[:2] != frame_hw:
+            self._logger.warning(
+                f"[STATE_RESIZE] camera={camera_id} "
+                f"recent_hw={st.recent_rgb01.shape[:2]} -> frame_hw={frame_hw}"
+            )
+            st.recent_rgb01 = self._resize_rgb01_to_hw(st.recent_rgb01, frame_hw)
+
     def gamma_rgb01(self, x: np.ndarray, gamma: float = 0.8) -> np.ndarray:
         x = np.clip(x, 0.0, 1.0)
         return np.power(x, gamma).astype(np.float32)
@@ -481,7 +477,6 @@ class StorageViolationFrameProcessor:
         camera_id = str(camera_id)
 
         original_h, original_w = frame_bgr.shape[:2]
-        resize_scale = 1.0
 
         cur_bgr = np.ascontiguousarray(frame_bgr)
         ideal_bgr = np.ascontiguousarray(ideal_bgr)
@@ -523,7 +518,7 @@ class StorageViolationFrameProcessor:
                     "candidate_len": 0,
                     "reported_len": 0,
                     "skipped_by_delta": True,
-                    "resize_scale": resize_scale,
+                    "resize_scale": 1.0,
                     "processed_hw": (h, w),
                     "original_hw": (original_h, original_w),
                     "frame_time_sec": frame_time_sec,
@@ -616,6 +611,8 @@ class StorageViolationFrameProcessor:
                 "candidate_len": len(candidate_boxes),
                 "reported_len": len(reported_boxes),
                 "skipped_by_delta": False,
+                "resize_scale": 1.0,
+                "processed_hw": (h, w),
                 "original_hw": (original_h, original_w),
                 "frame_time_sec": frame_time_sec,
                 "frame_time_ms": frame_time_ms,
