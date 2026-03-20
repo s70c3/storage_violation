@@ -517,7 +517,8 @@ class StorageViolationFrameProcessor:
         empty_rgb01 = self._blur_rgb01(empty_rgb01, ksize=3)
 
         recent_rgb01_for_cd = self.gamma_rgb01(recent_rgb01_for_cd, 0.8)
-        recent_blur = self._blur_rgb01(recent_rgb01_for_cd, ksize=15)
+        blur_size = (recent_rgb01_for_cd.shape[1] // 40) | 1
+        recent_blur = self._blur_rgb01(recent_rgb01_for_cd, ksize=blur_size)
         recent_rgb01_for_cd = (
             (1.0 - self.min_empty_weight) * recent_blur
             + self.min_empty_weight * st.empty_rgb01
