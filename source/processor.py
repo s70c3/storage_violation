@@ -4,7 +4,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -38,7 +38,7 @@ class StorageViolationFrameProcessor:
 
     Returns:
         - pending_candidate_boxes: red boxes, detected on current frame and not yet confirmed
-        - reported_boxes: green boxes, all already confirmed abandoned objects
+        - reported_boxes: green boxes, already confirmed abandoned objects that are still alive
         - candidate_boxes: alias of pending_candidate_boxes for compatibility
         - boxes: alias of reported_boxes for backward compatibility
     """
@@ -57,6 +57,7 @@ class StorageViolationFrameProcessor:
         threshold_hits: int = 10,
         threshold_time_sec: float = 5.0,
         expiration_time_sec: float = 30.0,
+        reported_miss_tolerance: int = 5,
         drop_reported: bool = False,
         pad_factor: float = 0.2,
         min_bbox_iou_gate: float = 0.3,
@@ -73,9 +74,9 @@ class StorageViolationFrameProcessor:
         self.camera_state: Dict[str, CameraEMAState] = {}
         self.queue_by_camera: Dict[str, CandidateQueueManager] = {}
 
-        # confirmed candidates per camera:
-        # {camera_id: {cand_id: bbox_int32}}
-        self.confirmed_by_camera: Dict[str, Dict[Any, np.ndarray]] = {}
+        # Active reported objects only:
+        # {camera_id: {cand_id: {"bbox": np.ndarray[int32, (4,)], "missed_frames": int}}}
+        self.reported_by_camera: Dict[str, Dict[Any, Dict[str, Any]]] = {}
 
         self.ema_tau_sec = float(ema_tau_sec)
         self.ema_min_alpha = float(ema_min_alpha)
@@ -90,6 +91,7 @@ class StorageViolationFrameProcessor:
         self.threshold_hits = int(threshold_hits)
         self.threshold_time_sec = float(threshold_time_sec)
         self.expiration_time_sec = float(expiration_time_sec)
+        self.reported_miss_tolerance = max(1, int(reported_miss_tolerance))
         self.drop_reported = bool(drop_reported)
 
         self.pad_factor = float(pad_factor)
@@ -114,7 +116,7 @@ class StorageViolationFrameProcessor:
         threshold_hits: int | None = None,
         threshold_time_sec: float | None = None,
         min_side: int | None = None,
-    ):
+    ) -> None:
         if threshold_hits is not None:
             self.threshold_hits = int(threshold_hits)
 
@@ -132,7 +134,7 @@ class StorageViolationFrameProcessor:
 
         for camera_id in list(self.queue_by_camera.keys()):
             self.queue_by_camera[camera_id] = self._make_queue_manager()
-            self.confirmed_by_camera[camera_id] = {}
+            self.reported_by_camera[camera_id] = {}
             self._logger.info(f"[PARAM_UPDATE] queue reset for camera={camera_id}")
 
     def load(self) -> None:
@@ -143,14 +145,14 @@ class StorageViolationFrameProcessor:
             self.cd_segmentator.close()
         self.camera_state.clear()
         self.queue_by_camera.clear()
-        self.confirmed_by_camera.clear()
+        self.reported_by_camera.clear()
         self._rt_iter_by_camera.clear()
 
     def reset_camera(self, camera_id: str) -> None:
         camera_id = str(camera_id)
         self.camera_state.pop(camera_id, None)
         self.queue_by_camera.pop(camera_id, None)
-        self.confirmed_by_camera.pop(camera_id, None)
+        self.reported_by_camera.pop(camera_id, None)
         self._rt_iter_by_camera.pop(camera_id, None)
 
     def _make_queue_manager(self) -> CandidateQueueManager:
@@ -173,8 +175,8 @@ class StorageViolationFrameProcessor:
             self.queue_by_camera[camera_id] = self._make_queue_manager()
             self._logger.info(f"[INIT] queue created for camera={camera_id}")
 
-        if camera_id not in self.confirmed_by_camera:
-            self.confirmed_by_camera[camera_id] = {}
+        if camera_id not in self.reported_by_camera:
+            self.reported_by_camera[camera_id] = {}
 
     def _should_detect(self, st: CameraEMAState, now_mono: float) -> bool:
         if (now_mono - st.last_detect_mono) >= float(self.delta):
@@ -267,23 +269,6 @@ class StorageViolationFrameProcessor:
         return np.array([x_min, y_min, x_max, y_max], dtype=np.float32)
 
     @staticmethod
-    def _extract_candidate_boxes(candidates: List[Any]) -> np.ndarray:
-        if not candidates:
-            return np.empty((0, 4), dtype=np.int32)
-
-        boxes = []
-        for c in candidates:
-            bbox = getattr(c, "bbox", None)
-            if bbox is None:
-                continue
-            boxes.append(np.asarray(bbox, dtype=np.int32))
-
-        if not boxes:
-            return np.empty((0, 4), dtype=np.int32)
-
-        return np.stack(boxes, axis=0)
-
-    @staticmethod
     def _stack_boxes(boxes: List[np.ndarray]) -> np.ndarray:
         if not boxes:
             return np.empty((0, 4), dtype=np.int32)
@@ -311,60 +296,111 @@ class StorageViolationFrameProcessor:
             return 0.0
         return float(inter / union)
 
-    def _split_current_vs_confirmed(
-        self,
-        current_boxes: np.ndarray,
-        confirmed_boxes: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        current_boxes -> detections from current frame only
-        confirmed_boxes -> all historically confirmed candidates
+    def _get_reported_boxes(self, camera_id: str) -> np.ndarray:
+        store = self.reported_by_camera.setdefault(camera_id, {})
+        if not store:
+            return np.empty((0, 4), dtype=np.int32)
+        return np.stack(
+            [np.asarray(item["bbox"], dtype=np.int32) for item in store.values()],
+            axis=0,
+        )
 
-        Returns:
-            pending_current_boxes: current detections that do NOT overlap confirmed ones
-            confirmed_boxes: unchanged
-        """
-        if len(current_boxes) == 0:
-            return np.empty((0, 4), dtype=np.int32), confirmed_boxes
-
-        if len(confirmed_boxes) == 0:
-            return current_boxes.astype(np.int32, copy=False), confirmed_boxes
-
-        pending = []
-        thr = float(self.min_bbox_iou_gate)
-
-        for cur_box in current_boxes:
-            matched_confirmed = False
-            for conf_box in confirmed_boxes:
-                if self._bbox_iou_xyxy(cur_box, conf_box) >= thr:
-                    matched_confirmed = True
-                    break
-            if not matched_confirmed:
-                pending.append(np.asarray(cur_box, dtype=np.int32))
-
-        if not pending:
-            return np.empty((0, 4), dtype=np.int32), confirmed_boxes
-
-        return np.stack(pending, axis=0), confirmed_boxes
-
-    def _update_confirmed_store(
+    def _update_reported_store(
         self,
         camera_id: str,
         ready_candidates: List[Any],
+        current_boxes: np.ndarray,
     ) -> np.ndarray:
-        store = self.confirmed_by_camera.setdefault(camera_id, {})
+        """
+        Keeps only active reported objects.
 
+        Rules:
+        - new ready candidates are inserted into reported store
+        - if a reported object is matched on current frame -> missed_frames = 0
+        - if not matched -> missed_frames += 1
+        - if missed_frames >= reported_miss_tolerance -> remove
+        """
+        store = self.reported_by_camera.setdefault(camera_id, {})
+
+        # Add newly confirmed objects
         for c in ready_candidates:
             cand_id = getattr(c, "cand_id", None)
             bbox = getattr(c, "bbox", None)
             if cand_id is None or bbox is None:
                 continue
-            store[cand_id] = np.asarray(bbox, dtype=np.int32)
+
+            store[cand_id] = {
+                "bbox": np.asarray(bbox, dtype=np.int32),
+                "missed_frames": 0,
+            }
 
         if not store:
             return np.empty((0, 4), dtype=np.int32)
 
-        return np.stack(list(store.values()), axis=0)
+        to_delete: List[Any] = []
+
+        for cand_id, item in store.items():
+            rep_box = np.asarray(item["bbox"], dtype=np.int32)
+
+            matched = False
+            for cur_box in current_boxes:
+                if self._bbox_iou_xyxy(rep_box, cur_box) >= float(self.min_bbox_iou_gate):
+                    matched = True
+                    item["bbox"] = np.asarray(cur_box, dtype=np.int32)
+                    item["missed_frames"] = 0
+                    break
+
+            if not matched:
+                item["missed_frames"] = int(item.get("missed_frames", 0)) + 1
+                if item["missed_frames"] >= self.reported_miss_tolerance:
+                    to_delete.append(cand_id)
+
+        for cand_id in to_delete:
+            del store[cand_id]
+
+        if not store:
+            return np.empty((0, 4), dtype=np.int32)
+
+        return np.stack(
+            [np.asarray(item["bbox"], dtype=np.int32) for item in store.values()],
+            axis=0,
+        )
+
+    def _split_current_vs_reported(
+        self,
+        current_boxes: np.ndarray,
+        reported_boxes: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        current_boxes -> detections from current frame only
+        reported_boxes -> all active already-reported objects
+
+        Returns:
+            pending_current_boxes: current detections that do NOT overlap reported ones
+            reported_boxes: unchanged
+        """
+        if len(current_boxes) == 0:
+            return np.empty((0, 4), dtype=np.int32), reported_boxes
+
+        if len(reported_boxes) == 0:
+            return current_boxes.astype(np.int32, copy=False), reported_boxes
+
+        pending = []
+        thr = float(self.min_bbox_iou_gate)
+
+        for cur_box in current_boxes:
+            matched_reported = False
+            for rep_box in reported_boxes:
+                if self._bbox_iou_xyxy(cur_box, rep_box) >= thr:
+                    matched_reported = True
+                    break
+            if not matched_reported:
+                pending.append(np.asarray(cur_box, dtype=np.int32))
+
+        if not pending:
+            return np.empty((0, 4), dtype=np.int32), reported_boxes
+
+        return np.stack(pending, axis=0), reported_boxes
 
     def _build_cd_tensor_1x9(
         self,
@@ -474,7 +510,7 @@ class StorageViolationFrameProcessor:
             recent_frame_i=0,
             recent_dt_accum=0.0,
         )
-        self.confirmed_by_camera[camera_id] = {}
+        self.reported_by_camera[camera_id] = {}
         self._logger.info(f"[INIT] state created for camera={camera_id}")
 
     def _ensure_camera_initialized(
@@ -534,16 +570,16 @@ class StorageViolationFrameProcessor:
 
         alpha_used = self._update_recent(st=st, cur_rgb01=cur_rgb01, now_mono=now_mono)
 
-        confirmed_boxes = self._update_confirmed_store(camera_id, ready_candidates=[])
+        reported_boxes = self._get_reported_boxes(camera_id)
 
         if not self._should_detect(st, now_mono):
             return {
                 "detected": False,
-                "status": len(confirmed_boxes) > 0,
-                "boxes": confirmed_boxes,
+                "status": len(reported_boxes) > 0,
+                "boxes": reported_boxes,
                 "candidate_boxes": np.empty((0, 4), dtype=np.int32),
                 "pending_candidate_boxes": np.empty((0, 4), dtype=np.int32),
-                "reported_boxes": confirmed_boxes,
+                "reported_boxes": reported_boxes,
                 "instance_masks": [],
                 "cd_mask01": None,
                 "fused_mask01": None,
@@ -554,7 +590,7 @@ class StorageViolationFrameProcessor:
                     "n_instances": 0,
                     "current_frame_boxes_len": 0,
                     "ready_len": 0,
-                    "confirmed_len": len(confirmed_boxes),
+                    "reported_len": len(reported_boxes),
                     "skipped_by_delta": True,
                 },
             }
@@ -599,13 +635,21 @@ class StorageViolationFrameProcessor:
         current_boxes = self._stack_boxes(current_bboxes)
 
         cq = self.queue_by_camera[camera_id]
-        snap, ready = cq.step(now=now_mono, current_masks=inst_masks, current_bboxes=current_bboxes)
+        snap, ready = cq.step(
+            now=now_mono,
+            current_masks=inst_masks,
+            current_bboxes=current_bboxes,
+        )
 
-        confirmed_boxes = self._update_confirmed_store(camera_id, ready_candidates=ready)
-
-        pending_candidate_boxes, reported_boxes = self._split_current_vs_confirmed(
+        reported_boxes = self._update_reported_store(
+            camera_id=camera_id,
+            ready_candidates=ready,
             current_boxes=current_boxes,
-            confirmed_boxes=confirmed_boxes,
+        )
+
+        pending_candidate_boxes, reported_boxes = self._split_current_vs_reported(
+            current_boxes=current_boxes,
+            reported_boxes=reported_boxes,
         )
 
         save_rt_panel(
@@ -624,7 +668,7 @@ class StorageViolationFrameProcessor:
         self._logger.info(
             f"[QUEUE] camera={camera_id} "
             f"current={len(current_boxes)}, snapshot={len(snap)}, ready_now={len(ready)}, "
-            f"pending_current={len(pending_candidate_boxes)}, confirmed_total={len(reported_boxes)}, "
+            f"pending_current={len(pending_candidate_boxes)}, reported_total={len(reported_boxes)}, "
             f"threshold_hits={self.threshold_hits}, drop_reported={self.drop_reported}"
         )
 
@@ -650,7 +694,7 @@ class StorageViolationFrameProcessor:
                 "snapshot_len": len(snap),
                 "ready_len": len(ready),
                 "pending_current_len": len(pending_candidate_boxes),
-                "confirmed_len": len(reported_boxes),
+                "reported_len": len(reported_boxes),
                 "skipped_by_delta": False,
             },
         }
