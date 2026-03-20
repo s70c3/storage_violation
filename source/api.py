@@ -28,9 +28,7 @@ MODEL_INP_CH = 9
 PROCESSOR_KWARGS = dict(
     threshold_hits=1,
     threshold_time_sec=5.0,
-    min_side=10,
-    tile_split_long_side=1000,
-    tile_overlap=64,
+    min_side=10
 )
 
 
