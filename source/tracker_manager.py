@@ -13,17 +13,16 @@ class TrackState:
     first_seen: float
     last_seen: float
     anchor_bbox: np.ndarray
+    prev_bbox: np.ndarray
     stationary_started: float
     is_stationary: bool = False
 
 
 class ByteTrackStationaryTracker:
     """
-    Ready-made ByteTrack + stationary logic on top of tracker_id.
-
     Returns:
         candidate_boxes:
-            all current detections that are NOT yet stationary
+            all current detections that are NOT stationary yet
 
         reported_boxes:
             current detections that are already stationary
@@ -71,8 +70,8 @@ class ByteTrackStationaryTracker:
         diag = float(np.hypot(b[2] - b[0], b[3] - b[1]))
         return c, max(diag, 1e-6)
 
-    def _moved_too_much(self, anchor_bbox: np.ndarray, cur_bbox: np.ndarray) -> bool:
-        c0, d0 = self._center_and_diag(anchor_bbox)
+    def _moved_too_much(self, ref_bbox: np.ndarray, cur_bbox: np.ndarray) -> bool:
+        c0, d0 = self._center_and_diag(ref_bbox)
         c1, _ = self._center_and_diag(cur_bbox)
 
         shift_px = float(np.linalg.norm(c1 - c0))
@@ -144,14 +143,6 @@ class ByteTrackStationaryTracker:
         current_bboxes: List[np.ndarray],
         current_masks: List[np.ndarray] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Returns:
-            candidate_boxes:
-                all current detections that are NOT stationary yet
-
-            reported_boxes:
-                current detections that are stationary
-        """
         if current_masks is None:
             current_masks = [None] * len(current_bboxes)
 
@@ -173,14 +164,10 @@ class ByteTrackStationaryTracker:
 
         current_boxes = np.asarray(current_bboxes, dtype=np.int32).reshape(-1, 4)
 
-        xyxy = current_boxes.astype(np.float32, copy=False)
-        conf = np.ones((len(current_bboxes),), dtype=np.float32)
-        class_id = np.zeros((len(current_bboxes),), dtype=int)
-
         detections = sv.Detections(
-            xyxy=xyxy,
-            confidence=conf,
-            class_id=class_id,
+            xyxy=current_boxes.astype(np.float32, copy=False),
+            confidence=np.ones((len(current_boxes),), dtype=np.float32),
+            class_id=np.zeros((len(current_boxes),), dtype=int),
             mask=np.asarray(current_masks, dtype=object) if current_masks else None,
         )
 
@@ -204,18 +191,25 @@ class ByteTrackStationaryTracker:
                         first_seen=now,
                         last_seen=now,
                         anchor_bbox=bbox.copy(),
+                        prev_bbox=bbox.copy(),
                         stationary_started=now,
                         is_stationary=False,
                     )
                     self._states[tid] = st
                 else:
+                    moved_from_anchor = self._moved_too_much(st.anchor_bbox, bbox)
+                    moved_from_prev = self._moved_too_much(st.prev_bbox, bbox)
+
                     st.last_seen = now
-                    if self._moved_too_much(st.anchor_bbox, bbox):
+
+                    if moved_from_anchor or moved_from_prev:
                         st.anchor_bbox = bbox.copy()
                         st.stationary_started = now
                         st.is_stationary = False
                     else:
                         st.is_stationary = (now - st.stationary_started) >= self.stationary_time_sec
+
+                    st.prev_bbox = bbox.copy()
 
                 if st.is_stationary:
                     reported_boxes.append(np.asarray(bbox, dtype=np.int32))
