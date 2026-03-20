@@ -29,12 +29,7 @@ PROCESSOR_KWARGS = dict(
     min_side=10,
     delta=0,
     stationary_time_sec=5.0,
-    tracker_lost_track_buffer=5,
-    tracker_match_iou=0.3,
-    tracker_max_center_shift_px=20.0,
-    tracker_max_center_shift_norm=0.08,
 )
-
 
 def decode_image_bytes(image_bytes: bytes) -> np.ndarray:
     arr = np.frombuffer(image_bytes, dtype=np.uint8)
