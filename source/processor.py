@@ -55,6 +55,7 @@ class StorageViolationFrameProcessor:
         tracker_max_center_shift_px: float = 20.0,
         tracker_max_center_shift_norm: float = 0.08,
         recent_update_every: int = 10,
+        max_long_side: int = 1280,
         logger: logging.Logger | None = None,
     ):
         self.cd_segmentator = cd_segmentator
@@ -83,6 +84,8 @@ class StorageViolationFrameProcessor:
         self.tracker_max_center_shift_norm = float(tracker_max_center_shift_norm)
 
         self.recent_update_every = max(1, int(recent_update_every))
+        self.max_long_side = int(max_long_side)
+
         self._rt_iter_by_camera: Dict[str, int] = {}
 
         self._logger = logger or logging.getLogger("StorageViolationProcessor")
@@ -162,6 +165,61 @@ class StorageViolationFrameProcessor:
     @staticmethod
     def _bgr_u8_to_rgb01(bgr_u8: np.ndarray) -> np.ndarray:
         return bgr_u8[..., ::-1].astype(np.float32) / 255.0
+
+    @staticmethod
+    def _resize_image_if_needed(
+        image: np.ndarray,
+        max_long_side: int,
+        interpolation: int,
+    ) -> tuple[np.ndarray, float]:
+        h, w = image.shape[:2]
+        long_side = max(h, w)
+
+        if long_side <= max_long_side:
+            return image, 1.0
+
+        scale = float(max_long_side) / float(long_side)
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        resized = cv2.resize(image, (new_w, new_h), interpolation=interpolation)
+        return resized, scale
+
+    @staticmethod
+    def _scale_polygons(
+        polygons: Optional[List[np.ndarray]],
+        scale: float,
+    ) -> Optional[List[np.ndarray]]:
+        if polygons is None or scale == 1.0:
+            return polygons
+
+        out: List[np.ndarray] = []
+        for polygon in polygons:
+            pts = np.asarray(polygon, dtype=np.float32)
+            if pts.ndim != 2 or pts.shape[1] != 2:
+                continue
+            pts = np.round(pts * scale).astype(np.int32)
+            out.append(pts)
+        return out
+
+    @staticmethod
+    def _scale_human_boxes_in_frame_obj(frame_obj: Any, scale: float) -> None:
+        if frame_obj is None or scale == 1.0:
+            return
+
+        raw_humans = getattr(frame_obj, "raw_humans", None)
+        raw_human_boxes = getattr(raw_humans, "boxes", None) if raw_humans is not None else None
+        if raw_human_boxes is None:
+            return
+
+        scaled_boxes = []
+        for box in raw_human_boxes:
+            b = np.asarray(box, dtype=np.float32)
+            if b.shape[-1] != 4:
+                scaled_boxes.append(box)
+                continue
+            b *= scale
+            scaled_boxes.append(np.round(b).astype(np.int32))
+        raw_humans.boxes = scaled_boxes
 
     def _build_zone_mask_u8(
         self,
@@ -386,7 +444,32 @@ class StorageViolationFrameProcessor:
             now_mono = time.monotonic()
 
         camera_id = str(camera_id)
-        cur_bgr = np.ascontiguousarray(frame_bgr)
+
+        original_h, original_w = frame_bgr.shape[:2]
+
+        cur_bgr, resize_scale = self._resize_image_if_needed(
+            np.ascontiguousarray(frame_bgr),
+            max_long_side=self.max_long_side,
+            interpolation=cv2.INTER_AREA,
+        )
+
+        if resize_scale != 1.0:
+            ideal_bgr, _ = self._resize_image_if_needed(
+                np.ascontiguousarray(ideal_bgr),
+                max_long_side=self.max_long_side,
+                interpolation=cv2.INTER_AREA,
+            )
+            polygons = self._scale_polygons(polygons, resize_scale)
+            self._scale_human_boxes_in_frame_obj(frame_obj, resize_scale)
+
+            self._logger.info(
+                f"[RESIZE] camera={camera_id} "
+                f"orig_hw=({original_h},{original_w}) resized_hw={cur_bgr.shape[:2]} "
+                f"scale={resize_scale:.4f}"
+            )
+        else:
+            ideal_bgr = np.ascontiguousarray(ideal_bgr)
+
         h, w = cur_bgr.shape[:2]
         cur_rgb01 = self._bgr_u8_to_rgb01(cur_bgr)
 
@@ -422,6 +505,9 @@ class StorageViolationFrameProcessor:
                     "candidate_len": 0,
                     "reported_len": 0,
                     "skipped_by_delta": True,
+                    "resize_scale": resize_scale,
+                    "processed_hw": (h, w),
+                    "original_hw": (original_h, original_w),
                 },
             }
 
@@ -507,5 +593,8 @@ class StorageViolationFrameProcessor:
                 "candidate_len": len(candidate_boxes),
                 "reported_len": len(reported_boxes),
                 "skipped_by_delta": False,
+                "resize_scale": resize_scale,
+                "processed_hw": (h, w),
+                "original_hw": (original_h, original_w),
             },
         }
