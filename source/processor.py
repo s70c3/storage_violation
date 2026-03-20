@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -24,6 +24,9 @@ class CameraEMAState:
     detect_started: bool = False
     recent_frame_i: int = 0
     recent_dt_accum: float = 0.0
+
+    empty_model_cache_hw: Optional[Tuple[int, int]] = None
+    empty_model_cache_rgb01: Optional[np.ndarray] = None
 
 
 class StorageViolationFrameProcessor:
@@ -170,18 +173,24 @@ class StorageViolationFrameProcessor:
     def _resize_rgb01_to_hw(
         rgb01: np.ndarray,
         target_hw: Tuple[int, int],
+        interpolation: int = cv2.INTER_LINEAR,
     ) -> np.ndarray:
         th, tw = target_hw
         h, w = rgb01.shape[:2]
-
         if (h, w) == (th, tw):
             return rgb01.astype(np.float32, copy=False)
+        return cv2.resize(rgb01, (tw, th), interpolation=interpolation).astype(np.float32, copy=False)
 
-        return cv2.resize(
-            rgb01,
-            (tw, th),
-            interpolation=cv2.INTER_LINEAR,
-        ).astype(np.float32, copy=False)
+    def _target_model_hw(self, hw: Tuple[int, int]) -> tuple[Tuple[int, int], float]:
+        h, w = hw
+        long_side = max(h, w)
+        if long_side <= self.max_long_side:
+            return (h, w), 1.0
+
+        scale = float(self.max_long_side) / float(long_side)
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        return (new_h, new_w), scale
 
     def _build_zone_mask_u8(
         self,
@@ -198,8 +207,7 @@ class StorageViolationFrameProcessor:
                 if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) < 3:
                     self._logger.warning(f"[ZONE] skip invalid polygon with shape={pts.shape}")
                     continue
-                pts = pts.reshape((-1, 1, 2))
-                cv2.fillPoly(zone_mask, [pts], 255)
+                cv2.fillPoly(zone_mask, [pts.reshape((-1, 1, 2))], 255)
         else:
             zone_mask[:, :] = 255
 
@@ -235,7 +243,7 @@ class StorageViolationFrameProcessor:
         h, w = m.shape[:2]
         out: List[np.ndarray] = []
         for c in cnts:
-            x, y, bw, bh = cv2.boundingRect(c)
+            _, _, bw, bh = cv2.boundingRect(c)
             side = min(bw, bh)
 
             if side <= 0:
@@ -284,13 +292,16 @@ class StorageViolationFrameProcessor:
         dt = now_mono - st.last_ts_mono
         st.last_ts_mono = now_mono
 
-        # Защитная проверка: в норме сюда уже должны приходить совпадающие размеры.
         if st.recent_rgb01.shape[:2] != cur_rgb01.shape[:2]:
             self._logger.warning(
                 f"[RECENT_RESIZE] recent_hw={st.recent_rgb01.shape[:2]} "
                 f"-> cur_hw={cur_rgb01.shape[:2]}"
             )
-            st.recent_rgb01 = self._resize_rgb01_to_hw(st.recent_rgb01, cur_rgb01.shape[:2])
+            st.recent_rgb01 = self._resize_rgb01_to_hw(
+                st.recent_rgb01,
+                cur_rgb01.shape[:2],
+                interpolation=cv2.INTER_LINEAR,
+            )
 
         st.recent_frame_i += 1
         st.recent_dt_accum += max(0.0, float(dt))
@@ -305,44 +316,83 @@ class StorageViolationFrameProcessor:
         st.recent_rgb01 = (1.0 - a) * st.recent_rgb01 + a * cur_rgb01
         return float(a)
 
+    def _prepare_empty_for_model(
+        self,
+        st: CameraEMAState,
+        target_hw: Tuple[int, int],
+    ) -> np.ndarray:
+        if (
+            st.empty_model_cache_rgb01 is not None
+            and st.empty_model_cache_hw == target_hw
+        ):
+            return st.empty_model_cache_rgb01
+
+        empty_model = self._resize_rgb01_to_hw(
+            st.empty_rgb01,
+            target_hw,
+            interpolation=cv2.INTER_AREA if target_hw != st.empty_rgb01.shape[:2] else cv2.INTER_LINEAR,
+        )
+        empty_model = self.gamma_rgb01(empty_model, 0.8)
+        empty_model = self._blur_rgb01(empty_model, ksize=3)
+
+        st.empty_model_cache_hw = target_hw
+        st.empty_model_cache_rgb01 = empty_model
+        return empty_model
+
+    def _prepare_cd_inputs(
+        self,
+        st: CameraEMAState,
+        cur_rgb01: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int], float]:
+        orig_hw = cur_rgb01.shape[:2]
+        model_hw, resize_scale = self._target_model_hw(orig_hw)
+
+        recent_rgb01_for_cd = (
+            (1.0 - self.min_empty_weight) * st.recent_rgb01
+            + self.min_empty_weight * st.empty_rgb01
+        )
+
+        if model_hw != orig_hw:
+            cur_model = self._resize_rgb01_to_hw(cur_rgb01, model_hw, interpolation=cv2.INTER_AREA)
+            recent_model = self._resize_rgb01_to_hw(
+                recent_rgb01_for_cd, model_hw, interpolation=cv2.INTER_AREA
+            )
+        else:
+            cur_model = cur_rgb01
+            recent_model = recent_rgb01_for_cd
+
+        empty_model = self._prepare_empty_for_model(st, model_hw)
+
+        recent_model = self.gamma_rgb01(recent_model, 0.8)
+        blur_size = max(3, (recent_model.shape[1] // 40) | 1)
+        recent_model = self._blur_rgb01(recent_model, ksize=blur_size)
+        recent_model = (
+            (1.0 - self.min_empty_weight) * recent_model
+            + self.min_empty_weight * empty_model
+        )
+
+        cur_model = self.gamma_rgb01(cur_model, 0.8)
+        cur_model = self._blur_rgb01(cur_model, ksize=3)
+
+        return empty_model, recent_model, cur_model, model_hw, resize_scale
+
     def _infer_cd_mask01(
         self,
-        empty_rgb01: np.ndarray,
-        recent_rgb01: np.ndarray,
-        cur_rgb01: np.ndarray,
+        empty_model: np.ndarray,
+        recent_model: np.ndarray,
+        cur_model: np.ndarray,
+        orig_hw: Tuple[int, int],
+        resize_scale: float,
         camera_id: str,
     ) -> np.ndarray:
-        if cur_rgb01.ndim != 3 or cur_rgb01.shape[2] != 3:
-            raise ValueError(f"cur_rgb01 must be HxWx3 float32, got {cur_rgb01.shape}")
+        exp_hw_model = cur_model.shape[:2]
 
-        orig_hw = cur_rgb01.shape[:2]
-        empty_model = empty_rgb01
-        recent_model = recent_rgb01
-        cur_model = cur_rgb01
-        resize_scale = 1.0
-
-        long_side = max(orig_hw)
-        if long_side > self.max_long_side:
-            resize_scale = float(self.max_long_side) / float(long_side)
-            new_w = max(1, int(round(orig_hw[1] * resize_scale)))
-            new_h = max(1, int(round(orig_hw[0] * resize_scale)))
-
-            empty_model = cv2.resize(
-                empty_rgb01, (new_w, new_h), interpolation=cv2.INTER_AREA
-            ).astype(np.float32, copy=False)
-            recent_model = cv2.resize(
-                recent_rgb01, (new_w, new_h), interpolation=cv2.INTER_AREA
-            ).astype(np.float32, copy=False)
-            cur_model = cv2.resize(
-                cur_rgb01, (new_w, new_h), interpolation=cv2.INTER_AREA
-            ).astype(np.float32, copy=False)
-
+        if resize_scale != 1.0:
             self._logger.info(
                 f"[MODEL_RESIZE] camera={camera_id} "
-                f"orig_hw={orig_hw} model_hw={cur_model.shape[:2]} scale={resize_scale:.4f}"
+                f"orig_hw={orig_hw} model_hw={exp_hw_model} scale={resize_scale:.4f}"
             )
 
-        exp_hw_model = cur_model.shape[:2]
         x = self._build_cd_tensor_1x9(empty_model, recent_model, cur_model)
 
         pred_fn = getattr(self.cd_segmentator, "predict_semantic01", None)
@@ -427,21 +477,31 @@ class StorageViolationFrameProcessor:
         self._ensure_camera_tracker(camera_id)
 
         st = self.camera_state[camera_id]
+        resized_state = False
 
-        # Приводим state к размеру кадра только при несовпадении.
         if st.empty_rgb01.shape[:2] != frame_hw:
             self._logger.warning(
                 f"[STATE_RESIZE] camera={camera_id} "
                 f"empty_hw={st.empty_rgb01.shape[:2]} -> frame_hw={frame_hw}"
             )
-            st.empty_rgb01 = self._resize_rgb01_to_hw(st.empty_rgb01, frame_hw)
+            st.empty_rgb01 = self._resize_rgb01_to_hw(
+                st.empty_rgb01, frame_hw, interpolation=cv2.INTER_LINEAR
+            )
+            resized_state = True
 
         if st.recent_rgb01.shape[:2] != frame_hw:
             self._logger.warning(
                 f"[STATE_RESIZE] camera={camera_id} "
                 f"recent_hw={st.recent_rgb01.shape[:2]} -> frame_hw={frame_hw}"
             )
-            st.recent_rgb01 = self._resize_rgb01_to_hw(st.recent_rgb01, frame_hw)
+            st.recent_rgb01 = self._resize_rgb01_to_hw(
+                st.recent_rgb01, frame_hw, interpolation=cv2.INTER_LINEAR
+            )
+            resized_state = True
+
+        if resized_state:
+            st.empty_model_cache_hw = None
+            st.empty_model_cache_rgb01 = None
 
     def gamma_rgb01(self, x: np.ndarray, gamma: float = 0.8) -> np.ndarray:
         x = np.clip(x, 0.0, 1.0)
@@ -475,8 +535,6 @@ class StorageViolationFrameProcessor:
             now_mono = time.monotonic()
 
         camera_id = str(camera_id)
-
-        original_h, original_w = frame_bgr.shape[:2]
 
         cur_bgr = np.ascontiguousarray(frame_bgr)
         ideal_bgr = np.ascontiguousarray(ideal_bgr)
@@ -520,36 +578,24 @@ class StorageViolationFrameProcessor:
                     "skipped_by_delta": True,
                     "resize_scale": 1.0,
                     "processed_hw": (h, w),
-                    "original_hw": (original_h, original_w),
+                    "original_hw": (h, w),
                     "frame_time_sec": frame_time_sec,
                     "frame_time_ms": frame_time_ms,
                 },
             }
 
-        recent_rgb01_for_cd = (
-            (1.0 - self.min_empty_weight) * st.recent_rgb01
-            + self.min_empty_weight * st.empty_rgb01
+        empty_model, recent_model, cur_model, model_hw, resize_scale = self._prepare_cd_inputs(
+            st=st,
+            cur_rgb01=cur_rgb01,
         )
-
-        empty_rgb01 = self.gamma_rgb01(st.empty_rgb01, 0.8)
-        empty_rgb01 = self._blur_rgb01(empty_rgb01, ksize=3)
-
-        recent_rgb01_for_cd = self.gamma_rgb01(recent_rgb01_for_cd, 0.8)
-        blur_size = max(3, (recent_rgb01_for_cd.shape[1] // 40) | 1)
-        recent_blur = self._blur_rgb01(recent_rgb01_for_cd, ksize=blur_size)
-        recent_rgb01_for_cd = (
-            (1.0 - self.min_empty_weight) * recent_blur
-            + self.min_empty_weight * st.empty_rgb01
-        )
-
-        cur_rgb01_proc = self.gamma_rgb01(cur_rgb01, 0.8)
-        cur_rgb01_proc = self._blur_rgb01(cur_rgb01_proc, ksize=3)
 
         cd_mask01 = self._infer_cd_mask01(
-            empty_rgb01,
-            recent_rgb01_for_cd,
-            cur_rgb01_proc,
-            camera_id,
+            empty_model=empty_model,
+            recent_model=recent_model,
+            cur_model=cur_model,
+            orig_hw=(h, w),
+            resize_scale=resize_scale,
+            camera_id=camera_id,
         )
 
         if not st.detect_started:
@@ -575,10 +621,11 @@ class StorageViolationFrameProcessor:
         # save_rt_panel(
         #     camera_id=camera_id,
         #     iter_idx=self._rt_iter_by_camera.get(camera_id, 0) + 1,
-        #     empty_rgb01=empty_rgb01,
-        #     recent_rgb01=recent_rgb01_for_cd,
-        #     cur_rgb01=cur_rgb01,
-        #     cd_mask01=cd_mask01,
+        #     empty_rgb01=empty_model,
+        #     recent_rgb01=recent_model,
+        #     cur_rgb01=cur_model,
+        #     cd_mask01=cv2.resize(cd_mask01, (model_hw[1], model_hw[0]), interpolation=cv2.INTER_LINEAR)
+        #         if model_hw != (h, w) else cd_mask01,
         #     candidate_boxes=candidate_boxes,
         #     reported_boxes=reported_boxes,
         #     logger=self._logger,
@@ -611,9 +658,10 @@ class StorageViolationFrameProcessor:
                 "candidate_len": len(candidate_boxes),
                 "reported_len": len(reported_boxes),
                 "skipped_by_delta": False,
-                "resize_scale": 1.0,
+                "resize_scale": resize_scale,
+                "model_hw": model_hw,
                 "processed_hw": (h, w),
-                "original_hw": (original_h, original_w),
+                "original_hw": (h, w),
                 "frame_time_sec": frame_time_sec,
                 "frame_time_ms": frame_time_ms,
             },
