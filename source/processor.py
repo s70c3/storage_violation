@@ -490,15 +490,11 @@ class StorageViolationFrameProcessor:
             f"reported_now={len(reported_boxes)} stationary_time_sec={self.stationary_time_sec}"
         )
 
-        candidate_boxes_list = candidate_boxes.astype(int).tolist()
-        reported_boxes_list = reported_boxes.astype(int).tolist()
         return {
             "detected": True,
             "status": (len(candidate_boxes) > 0 or len(reported_boxes) > 0),
-            "boxes": reported_boxes,
-            "candidate_boxes": candidate_boxes_list,
-            "pending_candidate_boxes": candidate_boxes,
-            "reported_boxes": reported_boxes_list,
+            "candidate_boxes": candidate_boxes,
+            "reported_boxes": reported_boxes,
             "instance_masks": inst_masks,
             "cd_mask01": cd_mask01,
             "fused_mask01": fused01,

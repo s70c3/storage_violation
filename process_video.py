@@ -55,10 +55,10 @@ def draw_result(frame_bgr, result: dict):
     detected = bool(result.get("detected", False))
     debug = result.get("debug", {})
 
+    print(result)
     candidate_boxes = result.get("candidate_boxes", [])
-    reported_boxes = result.get("reported_boxes", result.get("boxes", []))
+    reported_boxes = result.get("reported_boxes", [])
 
-    print("candidate_boxes", candidate_boxes)
     # Зеленые: видны сейчас, но еще не стоят достаточно долго
     for box in candidate_boxes:
         x1, y1, x2, y2 = map(int, box)
