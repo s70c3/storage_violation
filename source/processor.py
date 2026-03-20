@@ -12,8 +12,8 @@ import torch
 
 from .queue_manager import CandidateQueueManager
 from .segmentator import SemanticSegmentatorProtocol
+from .visualization import save_rt_panel
 
-from pathlib import Path
 
 @dataclass
 class CameraEMAState:
@@ -37,8 +37,9 @@ class StorageViolationFrameProcessor:
         process_frame(camera_id, frame_bgr, ideal_bgr, polygons=None, frame_obj=None)
 
     Returns:
-        - candidate_boxes: red boxes, current candidates from queue snapshot
+        - pending_candidate_boxes: red boxes, active not-yet-reported candidates
         - reported_boxes: green boxes, confirmed abandoned objects
+        - candidate_boxes: alias of pending_candidate_boxes for compatibility
         - boxes: alias of reported_boxes for backward compatibility
     """
 
@@ -46,34 +47,24 @@ class StorageViolationFrameProcessor:
         self,
         cd_segmentator: SemanticSegmentatorProtocol,
         delta: int = 0,
-
         ema_tau_sec: float = 5.0,
         ema_min_alpha: float = 0.02,
         ema_max_alpha: float = 0.12,
-
         min_empty_weight: float = 0.20,
-
         thr: float = 0.5,
         min_side: int = 100,
         morph_ksize: int = 3,
-
         threshold_hits: int = 10,
         threshold_time_sec: float = 5.0,
         expiration_time_sec: float = 30.0,
         drop_reported: bool = False,
-
         pad_factor: float = 0.2,
         min_bbox_iou_gate: float = 0.3,
         min_mask_iou: float = 0.6,
         w_bbox: float = 0.5,
         w_centroid: float = 0.3,
         w_mask: float = 0.2,
-
-        tile_split_long_side: int = 5000,
-        tile_overlap: int = 64,
-
         recent_update_every: int = 10,
-
         logger: logging.Logger | None = None,
     ):
         self.cd_segmentator = cd_segmentator
@@ -104,11 +95,10 @@ class StorageViolationFrameProcessor:
         self.w_centroid = float(w_centroid)
         self.w_mask = float(w_mask)
 
-        self.tile_split_long_side = int(tile_split_long_side)
-        self.tile_overlap = int(max(0, tile_overlap))
 
         self.recent_update_every = max(1, int(recent_update_every))
         self._rt_iter_by_camera: Dict[str, int] = {}
+
         self._logger = logger or logging.getLogger("StorageViolationProcessor")
         if not self._logger.handlers:
             logging.basicConfig(level=logging.INFO)
@@ -149,17 +139,20 @@ class StorageViolationFrameProcessor:
             self.cd_segmentator.close()
         self.camera_state.clear()
         self.queue_by_camera.clear()
+        self._rt_iter_by_camera.clear()
 
     def reset_camera(self, camera_id: str) -> None:
         camera_id = str(camera_id)
         self.camera_state.pop(camera_id, None)
         self.queue_by_camera.pop(camera_id, None)
+        self._rt_iter_by_camera.pop(camera_id, None)
 
     def _make_queue_manager(self) -> CandidateQueueManager:
         return CandidateQueueManager(
             threshold_hits=self.threshold_hits,
             threshold_time_sec=self.threshold_time_sec,
             expiration_time_sec=self.expiration_time_sec,
+            drop_reported=self.drop_reported,
             pad_factor=self.pad_factor,
             min_bbox_iou_gate=self.min_bbox_iou_gate,
             min_mask_iou=self.min_mask_iou,
@@ -268,14 +261,17 @@ class StorageViolationFrameProcessor:
     def _extract_candidate_boxes(candidates: List[Any]) -> np.ndarray:
         if not candidates:
             return np.empty((0, 4), dtype=np.int32)
+
         boxes = []
         for c in candidates:
             bbox = getattr(c, "bbox", None)
             if bbox is None:
                 continue
             boxes.append(np.asarray(bbox, dtype=np.int32))
+
         if not boxes:
             return np.empty((0, 4), dtype=np.int32)
+
         return np.stack(boxes, axis=0)
 
     def _build_cd_tensor_1x9(
@@ -318,104 +314,64 @@ class StorageViolationFrameProcessor:
         return float(a)
 
     def _infer_cd_mask01(
-        self,
-        empty_rgb01: np.ndarray,
-        recent_rgb01: np.ndarray,
-        cur_rgb01: np.ndarray,
-        camera_id: str,
+            self,
+            empty_rgb01: np.ndarray,
+            recent_rgb01: np.ndarray,
+            cur_rgb01: np.ndarray,
+            camera_id: str,
     ) -> np.ndarray:
         if cur_rgb01.ndim != 3 or cur_rgb01.shape[2] != 3:
             raise ValueError(f"cur_rgb01 must be HxWx3 float32, got {cur_rgb01.shape}")
 
-        h, w = cur_rgb01.shape[:2]
-        long_side = max(h, w)
-        split = long_side > self.tile_split_long_side
-        ov = int(self.tile_overlap)
+        exp_hw = (cur_rgb01.shape[0], cur_rgb01.shape[1])
+        x = self._build_cd_tensor_1x9(empty_rgb01, recent_rgb01, cur_rgb01)
 
-        def infer_tile(e_tile: np.ndarray, r_tile: np.ndarray, c_tile: np.ndarray) -> np.ndarray:
-            x = self._build_cd_tensor_1x9(e_tile, r_tile, c_tile)
+        pred_fn = getattr(self.cd_segmentator, "predict_semantic01", None)
+        if callable(pred_fn):
+            sem01 = pred_fn(x, {"camera_id": camera_id})
+            sem01 = np.asarray(sem01, dtype=np.float32)
 
-            pred_fn = getattr(self.cd_segmentator, "predict_semantic01", None)
-            if callable(pred_fn):
-                sem01 = pred_fn(x, {"camera_id": camera_id})
-                sem01 = np.asarray(sem01, dtype=np.float32)
-                exp_hw = (c_tile.shape[0], c_tile.shape[1])
-                if sem01.shape != exp_hw:
-                    self._logger.warning(
-                        f"[CD_TILE] predict_semantic01 bad shape={sem01.shape}, expected={exp_hw}"
-                    )
-                    return np.zeros(exp_hw, np.float32)
-                return sem01
-
-            cd_res = self.cd_segmentator([x], {"camera_id": camera_id})
-            if not cd_res:
-                return np.zeros((c_tile.shape[0], c_tile.shape[1]), np.float32)
-
-            bm = getattr(cd_res[0], "binary_masks", None)
-            masks = [] if (bm is None or bm.masks is None) else (bm.masks or [])
-            if not masks:
-                return np.zeros((c_tile.shape[0], c_tile.shape[1]), np.float32)
-
-            sem = np.zeros((c_tile.shape[0], c_tile.shape[1]), dtype=bool)
-            for m in masks:
-                sem |= np.asarray(m, dtype=bool)
-
-            return sem.astype(np.float32, copy=False)
-
-        if not split:
-            return infer_tile(empty_rgb01, recent_rgb01, cur_rgb01)
-
-        hm = h // 2
-        wm = w // 2
-        base_tiles = [
-            (0, hm, 0, wm),
-            (0, hm, wm, w),
-            (hm, h, 0, wm),
-            (hm, h, wm, w),
-        ]
-
-        out = np.zeros((h, w), np.float32)
-
-        for (y0, y1, x0, x1) in base_tiles:
-            ey0 = max(0, y0 - ov)
-            ey1 = min(h, y1 + ov)
-            ex0 = max(0, x0 - ov)
-            ex1 = min(w, x1 + ov)
-
-            pred = infer_tile(
-                empty_rgb01[ey0:ey1, ex0:ex1],
-                recent_rgb01[ey0:ey1, ex0:ex1],
-                cur_rgb01[ey0:ey1, ex0:ex1],
-            )
-
-            exp_hw = (ey1 - ey0, ex1 - ex0)
-            if pred.shape != exp_hw:
+            if sem01.shape != exp_hw:
                 self._logger.warning(
-                    f"[CD_TILE] pred shape mismatch {pred.shape} vs {exp_hw}; using zeros"
+                    f"[CD] predict_semantic01 bad shape={sem01.shape}, expected={exp_hw}"
                 )
-                pred = np.zeros(exp_hw, np.float32)
+                return np.zeros(exp_hw, np.float32)
 
-            out[ey0:ey1, ex0:ex1] = np.maximum(out[ey0:ey1, ex0:ex1], pred)
+            return sem01
 
-        return out
+        cd_res = self.cd_segmentator([x], {"camera_id": camera_id})
+        if not cd_res:
+            return np.zeros(exp_hw, np.float32)
+
+        bm = getattr(cd_res[0], "binary_masks", None)
+        masks = [] if (bm is None or bm.masks is None) else (bm.masks or [])
+        if not masks:
+            return np.zeros(exp_hw, np.float32)
+
+        sem = np.zeros(exp_hw, dtype=bool)
+        for m in masks:
+            sem |= np.asarray(m, dtype=bool)
+
+        return sem.astype(np.float32, copy=False)
 
     def _init_camera_state_if_needed(
-        self,
-        camera_id: str,
-        frame_hw: Tuple[int, int],
-        ideal_bgr: np.ndarray,
-        now_mono: float,
+            self,
+            camera_id: str,
+            frame_hw: Tuple[int, int],
+            ideal_bgr: np.ndarray,
+            now_mono: float,
     ) -> None:
         if camera_id in self.camera_state:
             return
 
         h, w = frame_hw
         empty_rgb01 = self._bgr_u8_to_rgb01(ideal_bgr)
-        if empty_rgb01.shape[:2] != (h, w):
-            self._logger.warning(
-                f"[INIT] camera={camera_id} ideal size={empty_rgb01.shape[:2]} != frame size={(h, w)}; using resize"
-            )
 
+        if empty_rgb01.shape[:2] != (h, w):
+            raise ValueError(
+                f"ideal/frame size mismatch for camera={camera_id}: "
+                f"ideal={empty_rgb01.shape[:2]} frame={(h, w)}"
+            )
 
         self.camera_state[camera_id] = CameraEMAState(
             empty_rgb01=empty_rgb01,
@@ -451,141 +407,16 @@ class StorageViolationFrameProcessor:
         return cv2.GaussianBlur(rgb01, (ksize, ksize), 0)
 
     @staticmethod
-    def _rgb01_to_bgr_u8(rgb01: np.ndarray) -> np.ndarray:
-        rgb01 = np.clip(rgb01, 0.0, 1.0)
-        return (rgb01[..., ::-1] * 255.0).astype(np.uint8)
-
-
-    @staticmethod
-    def _mask01_to_bgr_u8(mask01: np.ndarray) -> np.ndarray:
-        if mask01 is None:
-            return np.zeros((1, 1, 3), np.uint8)
-        m = np.clip(mask01, 0.0, 1.0)
-        m_u8 = (m * 255.0).astype(np.uint8)
-        return cv2.cvtColor(m_u8, cv2.COLOR_GRAY2BGR)
-
-    def _save_rt_panel(
-            self,
-            camera_id: str,
-            empty_rgb01: np.ndarray,
-            recent_rgb01: np.ndarray,
-            cur_rgb01: np.ndarray,
-            cd_mask01: np.ndarray,
-            inst_bboxes: List[np.ndarray],
-    ) -> None:
-        try:
-            rt_dir = Path("/tmp/rt_tests")
-            rt_dir.mkdir(parents=True, exist_ok=True)
-
-            ideal_bgr = self._rgb01_to_bgr_u8(empty_rgb01)
-            recent_bgr = self._rgb01_to_bgr_u8(recent_rgb01)
-            cur_bgr = self._rgb01_to_bgr_u8(cur_rgb01)
-            cd_bgr = self._mask01_to_bgr_u8(cd_mask01)
-
-            def draw_boxes(img: np.ndarray, boxes_xyxy) -> np.ndarray:
-                out = img.copy()
-                for b in boxes_xyxy:
-                    x1, y1, x2, y2 = map(int, np.asarray(b).tolist())
-                    cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                return out
-
-            def put_label(img: np.ndarray, text: str) -> np.ndarray:
-                out = img.copy()
-                cv2.putText(
-                    out,
-                    text,
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 0, 0),
-                    4,
-                    cv2.LINE_AA,
-                )
-                cv2.putText(
-                    out,
-                    text,
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-                return out
-
-            def make_overlay(base_bgr: np.ndarray, top_bgr: np.ndarray, alpha: float = 0.5) -> np.ndarray:
-                if base_bgr.shape[:2] != top_bgr.shape[:2]:
-                    top_bgr = cv2.resize(
-                        top_bgr,
-                        (base_bgr.shape[1], base_bgr.shape[0]),
-                        interpolation=cv2.INTER_AREA,
-                    )
-                return cv2.addWeighted(base_bgr, 1.0 - alpha, top_bgr, alpha, 0.0)
-
-            def resize_thumb(img: np.ndarray, max_w: int = 420, max_h: int = 240) -> np.ndarray:
-                h, w = img.shape[:2]
-                if h <= 0 or w <= 0:
-                    return np.zeros((max_h, max_w, 3), dtype=np.uint8)
-                scale = min(max_w / w, max_h / h)
-                new_w = max(1, int(w * scale))
-                new_h = max(1, int(h * scale))
-                return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-            def pad_to_size(img: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
-                h, w = img.shape[:2]
-                top = (target_h - h) // 2
-                bottom = target_h - h - top
-                left = (target_w - w) // 2
-                right = target_w - w - left
-                return cv2.copyMakeBorder(
-                    img,
-                    top,
-                    bottom,
-                    left,
-                    right,
-                    borderType=cv2.BORDER_CONSTANT,
-                    value=(20, 20, 20),
-                )
-
-            cur_bgr_boxed = draw_boxes(cur_bgr, inst_bboxes)
-            cd_bgr_boxed = draw_boxes(cd_bgr, inst_bboxes)
-            overlay_bgr = make_overlay(ideal_bgr, cur_bgr, alpha=0.5)
-            overlay_bgr_boxed = draw_boxes(overlay_bgr, inst_bboxes)
-
-            tiles = [
-                put_label(ideal_bgr, "ideal"),
-                put_label(recent_bgr, "recent"),
-                put_label(cur_bgr_boxed, f"current (n={len(inst_bboxes)})"),
-                put_label(cd_bgr_boxed, "cd (boxed)"),
-                put_label(overlay_bgr_boxed, "ideal + current"),
-                np.full_like(ideal_bgr, 20),
-            ]
-
-            thumbs = [resize_thumb(t, max_w=420, max_h=240) for t in tiles[:6]]
-
-            target_h = max(t.shape[0] for t in thumbs)
-            target_w = max(t.shape[1] for t in thumbs)
-            thumbs = [pad_to_size(t, target_w, target_h) for t in thumbs]
-
-            spacer = np.full((target_h, 12, 3), 20, dtype=np.uint8)
-            hspacer = np.full((12, target_w * 3 + 24, 3), 20, dtype=np.uint8)
-
-            row1 = cv2.hconcat([thumbs[0], spacer, thumbs[1], spacer, thumbs[2]])
-            row2 = cv2.hconcat([thumbs[3], spacer, thumbs[4], spacer, thumbs[5]])
-            panel = cv2.vconcat([row1, hspacer, row2])
-
-            it = self._rt_iter_by_camera.get(camera_id, 0) + 1
-            self._rt_iter_by_camera[camera_id] = it
-            ts_ms = int(time.time() * 1000)
-            out_path = rt_dir / f"cam_{camera_id}_it_{it:06d}_{ts_ms}.jpg"
-
-            ok = cv2.imwrite(str(out_path), panel)
-            if not ok:
-                self._logger.warning(f"[RT_SAVE] cv2.imwrite returned False: {out_path}")
-
-        except Exception as e:
-            self._logger.warning(f"[RT_SAVE] failed to save debug panel: {e}")
-
+    def _split_pending_and_reported(
+        snapshot_candidates: List[Any],
+        ready_candidates: List[Any],
+    ) -> Tuple[List[Any], List[Any]]:
+        ready_ids = {getattr(c, "cand_id", None) for c in ready_candidates}
+        pending_candidates = [
+            c for c in snapshot_candidates
+            if getattr(c, "cand_id", None) not in ready_ids
+        ]
+        return pending_candidates, ready_candidates
 
     def process_frame(
         self,
@@ -628,6 +459,7 @@ class StorageViolationFrameProcessor:
                 "status": False,
                 "boxes": np.empty((0, 4), dtype=np.int32),
                 "candidate_boxes": np.empty((0, 4), dtype=np.int32),
+                "pending_candidate_boxes": np.empty((0, 4), dtype=np.int32),
                 "reported_boxes": np.empty((0, 4), dtype=np.int32),
                 "instance_masks": [],
                 "cd_mask01": None,
@@ -661,14 +493,12 @@ class StorageViolationFrameProcessor:
         cur_rgb01_proc = self.gamma_rgb01(cur_rgb01, 0.8)
         cur_rgb01_proc = self._blur_rgb01(cur_rgb01_proc, ksize=3)
 
-
         cd_mask01 = self._infer_cd_mask01(
             empty_rgb01,
             recent_rgb01_for_cd,
             cur_rgb01_proc,
             camera_id,
         )
-
 
         if not st.detect_started:
             st.detect_started = True
@@ -686,31 +516,38 @@ class StorageViolationFrameProcessor:
         bboxes = [self._get_bbox(m) for m in inst_masks]
         snap, ready = cq.step(now=now_mono, current_masks=inst_masks, current_bboxes=bboxes)
 
-        self._save_rt_panel(
+        pending_candidates, reported_candidates = self._split_pending_and_reported(snap, ready)
+        pending_candidate_boxes = self._extract_candidate_boxes(pending_candidates)
+        reported_boxes = self._extract_candidate_boxes(reported_candidates)
+
+        save_rt_panel(
             camera_id=camera_id,
+            iter_idx=self._rt_iter_by_camera.get(camera_id, 0) + 1,
             empty_rgb01=empty_rgb01,
             recent_rgb01=recent_rgb01_for_cd,
             cur_rgb01=cur_rgb01,
             cd_mask01=cd_mask01,
-            inst_bboxes=bboxes,
+            pending_boxes=pending_candidate_boxes,
+            reported_boxes=reported_boxes,
+            logger=self._logger,
         )
-
-
-        candidate_boxes = self._extract_candidate_boxes(snap)
-        reported_boxes = self._extract_candidate_boxes(ready)
+        self._rt_iter_by_camera[camera_id] = self._rt_iter_by_camera.get(camera_id, 0) + 1
 
         self._logger.info(
-            f"[QUEUE] camera={camera_id} snapshot={len(snap)}, ready={len(ready)}, threshold_hits={self.threshold_hits}"
+            f"[QUEUE] camera={camera_id} snapshot={len(snap)}, ready={len(ready)}, "
+            f"pending={len(pending_candidates)}, threshold_hits={self.threshold_hits}, "
+            f"drop_reported={self.drop_reported}"
         )
 
-        if len(ready) > 0 and hasattr(cq, "on_report"):
-            cq.on_report([c.cand_id for c in ready])
+        if len(reported_candidates) > 0 and hasattr(cq, "on_report"):
+            cq.on_report([c.cand_id for c in reported_candidates])
 
         return {
             "detected": True,
-            "status": len(ready) > 0,
-            "boxes": reported_boxes,          # backward compatibility
-            "candidate_boxes": candidate_boxes,
+            "status": len(reported_candidates) > 0,
+            "boxes": reported_boxes,
+            "candidate_boxes": pending_candidate_boxes,
+            "pending_candidate_boxes": pending_candidate_boxes,
             "reported_boxes": reported_boxes,
             "instance_masks": inst_masks,
             "cd_mask01": cd_mask01,
@@ -722,6 +559,7 @@ class StorageViolationFrameProcessor:
                 "n_instances": len(inst_masks),
                 "snapshot_len": len(snap),
                 "ready_len": len(ready),
+                "pending_len": len(pending_candidates),
                 "skipped_by_delta": False,
             },
         }
