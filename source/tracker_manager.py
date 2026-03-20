@@ -19,13 +19,14 @@ class TrackState:
 
 class ByteTrackStationaryTracker:
     """
-    Ready-made ByteTrack + simple stationary logic on top of tracker_id.
+    Ready-made ByteTrack + stationary logic on top of tracker_id.
 
-    candidate_tracks:
-        visible now, but not stationary long enough yet
+    Returns:
+        candidate_boxes:
+            all current detections that are NOT yet stationary
 
-    reported_tracks:
-        visible now and stationary long enough
+        reported_boxes:
+            current detections that are already stationary
     """
 
     def __init__(
@@ -52,6 +53,10 @@ class ByteTrackStationaryTracker:
         self.max_center_shift_px = float(max_center_shift_px)
         self.max_center_shift_norm = float(max_center_shift_norm)
 
+        self.lost_track_buffer = int(lost_track_buffer)
+        self.frame_rate = max(1, int(frame_rate))
+        self.state_ttl_sec = max(1.0, float(self.lost_track_buffer) / float(self.frame_rate))
+
         self._states: Dict[int, TrackState] = {}
         self._logger = logger or logging.getLogger("ByteTrackStationaryTracker")
 
@@ -75,6 +80,64 @@ class ByteTrackStationaryTracker:
 
         return (shift_px > self.max_center_shift_px) or (shift_norm > self.max_center_shift_norm)
 
+    @staticmethod
+    def _bbox_iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
+        ax1, ay1, ax2, ay2 = map(float, a)
+        bx1, by1, bx2, by2 = map(float, b)
+
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+
+        iw = max(0.0, inter_x2 - inter_x1)
+        ih = max(0.0, inter_y2 - inter_y1)
+        inter = iw * ih
+
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union = area_a + area_b - inter
+
+        if union <= 1e-6:
+            return 0.0
+        return float(inter / union)
+
+    def _current_minus_reported(
+        self,
+        current_boxes: np.ndarray,
+        reported_boxes: np.ndarray,
+        iou_thr: float = 0.3,
+    ) -> np.ndarray:
+        if len(current_boxes) == 0:
+            return np.empty((0, 4), dtype=np.int32)
+
+        if len(reported_boxes) == 0:
+            return current_boxes.astype(np.int32, copy=False)
+
+        candidate = []
+        for cur_box in current_boxes:
+            matched_reported = False
+            for rep_box in reported_boxes:
+                if self._bbox_iou_xyxy(cur_box, rep_box) >= float(iou_thr):
+                    matched_reported = True
+                    break
+            if not matched_reported:
+                candidate.append(np.asarray(cur_box, dtype=np.int32))
+
+        if not candidate:
+            return np.empty((0, 4), dtype=np.int32)
+
+        return np.stack(candidate, axis=0)
+
+    def _cleanup_stale_states(self, now: float) -> None:
+        stale_ids = [
+            tid
+            for tid, st in self._states.items()
+            if (now - st.last_seen) > self.state_ttl_sec
+        ]
+        for tid in stale_ids:
+            self._states.pop(tid, None)
+
     def update(
         self,
         now: float,
@@ -83,8 +146,11 @@ class ByteTrackStationaryTracker:
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Returns:
-            candidate_boxes: visible now, not stationary yet
-            reported_boxes: visible now, stationary long enough
+            candidate_boxes:
+                all current detections that are NOT stationary yet
+
+            reported_boxes:
+                current detections that are stationary
         """
         if current_masks is None:
             current_masks = [None] * len(current_bboxes)
@@ -93,19 +159,21 @@ class ByteTrackStationaryTracker:
             raise ValueError("current_masks/current_bboxes must have same length")
 
         if len(current_bboxes) == 0:
-            # прогоняем пустые детекции через трекер, чтобы он обновил свое внутреннее состояние
             empty = sv.Detections(
                 xyxy=np.empty((0, 4), dtype=np.float32),
                 confidence=np.empty((0,), dtype=np.float32),
                 class_id=np.empty((0,), dtype=int),
             )
-            tracked = self.tracker.update_with_detections(empty)
+            _ = self.tracker.update_with_detections(empty)
+            self._cleanup_stale_states(now)
             return (
                 np.empty((0, 4), dtype=np.int32),
                 np.empty((0, 4), dtype=np.int32),
             )
 
-        xyxy = np.asarray(current_bboxes, dtype=np.float32).reshape(-1, 4)
+        current_boxes = np.asarray(current_bboxes, dtype=np.int32).reshape(-1, 4)
+
+        xyxy = current_boxes.astype(np.float32, copy=False)
         conf = np.ones((len(current_bboxes),), dtype=np.float32)
         class_id = np.zeros((len(current_bboxes),), dtype=int)
 
@@ -118,55 +186,52 @@ class ByteTrackStationaryTracker:
 
         tracked = self.tracker.update_with_detections(detections)
 
-        tracker_ids = tracked.tracker_id
-        if tracker_ids is None:
-            return (
-                np.empty((0, 4), dtype=np.int32),
-                np.empty((0, 4), dtype=np.int32),
-            )
-
-        visible_ids: set[int] = set()
-        candidate_boxes: List[np.ndarray] = []
         reported_boxes: List[np.ndarray] = []
 
-        for i in range(len(tracked.xyxy)):
-            tid = tracker_ids[i]
-            if tid is None:
-                continue
+        tracker_ids = tracked.tracker_id
+        if tracker_ids is not None:
+            for i in range(len(tracked.xyxy)):
+                tid = tracker_ids[i]
+                if tid is None:
+                    continue
 
-            tid = int(tid)
-            bbox = np.asarray(tracked.xyxy[i], dtype=np.float32)
-            visible_ids.add(tid)
+                tid = int(tid)
+                bbox = np.asarray(tracked.xyxy[i], dtype=np.float32)
 
-            st = self._states.get(tid)
-            if st is None:
-                st = TrackState(
-                    first_seen=now,
-                    last_seen=now,
-                    anchor_bbox=bbox.copy(),
-                    stationary_started=now,
-                    is_stationary=False,
-                )
-                self._states[tid] = st
-            else:
-                st.last_seen = now
-                if self._moved_too_much(st.anchor_bbox, bbox):
-                    st.anchor_bbox = bbox.copy()
-                    st.stationary_started = now
-                    st.is_stationary = False
+                st = self._states.get(tid)
+                if st is None:
+                    st = TrackState(
+                        first_seen=now,
+                        last_seen=now,
+                        anchor_bbox=bbox.copy(),
+                        stationary_started=now,
+                        is_stationary=False,
+                    )
+                    self._states[tid] = st
                 else:
-                    st.is_stationary = (now - st.stationary_started) >= self.stationary_time_sec
+                    st.last_seen = now
+                    if self._moved_too_much(st.anchor_bbox, bbox):
+                        st.anchor_bbox = bbox.copy()
+                        st.stationary_started = now
+                        st.is_stationary = False
+                    else:
+                        st.is_stationary = (now - st.stationary_started) >= self.stationary_time_sec
 
-            if st.is_stationary:
-                reported_boxes.append(bbox.astype(np.int32))
-            else:
-                candidate_boxes.append(bbox.astype(np.int32))
+                if st.is_stationary:
+                    reported_boxes.append(np.asarray(bbox, dtype=np.int32))
 
-        # Чистим состояния треков, которых больше нет у ByteTrack
-        stale_ids = [tid for tid in self._states.keys() if tid not in visible_ids]
-        for tid in stale_ids:
-            self._states.pop(tid, None)
+        self._cleanup_stale_states(now)
 
-        cand = np.stack(candidate_boxes, axis=0) if candidate_boxes else np.empty((0, 4), dtype=np.int32)
-        rep = np.stack(reported_boxes, axis=0) if reported_boxes else np.empty((0, 4), dtype=np.int32)
-        return cand, rep
+        reported_arr = (
+            np.stack(reported_boxes, axis=0)
+            if reported_boxes
+            else np.empty((0, 4), dtype=np.int32)
+        )
+
+        candidate_arr = self._current_minus_reported(
+            current_boxes=current_boxes,
+            reported_boxes=reported_arr,
+            iou_thr=0.3,
+        )
+
+        return candidate_arr, reported_arr
