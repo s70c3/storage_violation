@@ -26,10 +26,13 @@ MODEL_HALF = True
 MODEL_INP_CH = 9
 
 PROCESSOR_KWARGS = dict(
-    threshold_hits=10,
-    threshold_time_sec=0,
     min_side=10,
-    delta = 0
+    delta=0,
+    stationary_time_sec=5.0,
+    tracker_max_missed_frames=5,
+    tracker_match_iou=0.3,
+    tracker_max_center_shift_px=20.0,
+    tracker_max_center_shift_norm=0.08,
 )
 
 
