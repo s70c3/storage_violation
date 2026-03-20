@@ -37,8 +37,8 @@ class StorageViolationFrameProcessor:
         process_frame(camera_id, frame_bgr, ideal_bgr, polygons=None, frame_obj=None)
 
     Returns:
-        - pending_candidate_boxes: red boxes, active not-yet-reported candidates
-        - reported_boxes: green boxes, confirmed abandoned objects
+        - pending_candidate_boxes: red boxes, detected on current frame and not yet confirmed
+        - reported_boxes: green boxes, all already confirmed abandoned objects
         - candidate_boxes: alias of pending_candidate_boxes for compatibility
         - boxes: alias of reported_boxes for backward compatibility
     """
@@ -46,7 +46,7 @@ class StorageViolationFrameProcessor:
     def __init__(
         self,
         cd_segmentator: SemanticSegmentatorProtocol,
-        delta: int = 0,
+        delta: int = 2,
         ema_tau_sec: float = 5.0,
         ema_min_alpha: float = 0.02,
         ema_max_alpha: float = 0.12,
@@ -73,6 +73,10 @@ class StorageViolationFrameProcessor:
         self.camera_state: Dict[str, CameraEMAState] = {}
         self.queue_by_camera: Dict[str, CandidateQueueManager] = {}
 
+        # confirmed candidates per camera:
+        # {camera_id: {cand_id: bbox_int32}}
+        self.confirmed_by_camera: Dict[str, Dict[Any, np.ndarray]] = {}
+
         self.ema_tau_sec = float(ema_tau_sec)
         self.ema_min_alpha = float(ema_min_alpha)
         self.ema_max_alpha = float(ema_max_alpha)
@@ -94,7 +98,6 @@ class StorageViolationFrameProcessor:
         self.w_bbox = float(w_bbox)
         self.w_centroid = float(w_centroid)
         self.w_mask = float(w_mask)
-
 
         self.recent_update_every = max(1, int(recent_update_every))
         self._rt_iter_by_camera: Dict[str, int] = {}
@@ -129,6 +132,7 @@ class StorageViolationFrameProcessor:
 
         for camera_id in list(self.queue_by_camera.keys()):
             self.queue_by_camera[camera_id] = self._make_queue_manager()
+            self.confirmed_by_camera[camera_id] = {}
             self._logger.info(f"[PARAM_UPDATE] queue reset for camera={camera_id}")
 
     def load(self) -> None:
@@ -139,12 +143,14 @@ class StorageViolationFrameProcessor:
             self.cd_segmentator.close()
         self.camera_state.clear()
         self.queue_by_camera.clear()
+        self.confirmed_by_camera.clear()
         self._rt_iter_by_camera.clear()
 
     def reset_camera(self, camera_id: str) -> None:
         camera_id = str(camera_id)
         self.camera_state.pop(camera_id, None)
         self.queue_by_camera.pop(camera_id, None)
+        self.confirmed_by_camera.pop(camera_id, None)
         self._rt_iter_by_camera.pop(camera_id, None)
 
     def _make_queue_manager(self) -> CandidateQueueManager:
@@ -166,6 +172,9 @@ class StorageViolationFrameProcessor:
         if camera_id not in self.queue_by_camera:
             self.queue_by_camera[camera_id] = self._make_queue_manager()
             self._logger.info(f"[INIT] queue created for camera={camera_id}")
+
+        if camera_id not in self.confirmed_by_camera:
+            self.confirmed_by_camera[camera_id] = {}
 
     def _should_detect(self, st: CameraEMAState, now_mono: float) -> bool:
         if (now_mono - st.last_detect_mono) >= float(self.delta):
@@ -274,6 +283,89 @@ class StorageViolationFrameProcessor:
 
         return np.stack(boxes, axis=0)
 
+    @staticmethod
+    def _stack_boxes(boxes: List[np.ndarray]) -> np.ndarray:
+        if not boxes:
+            return np.empty((0, 4), dtype=np.int32)
+        return np.stack([np.asarray(b, dtype=np.int32) for b in boxes], axis=0)
+
+    @staticmethod
+    def _bbox_iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
+        ax1, ay1, ax2, ay2 = map(float, a)
+        bx1, by1, bx2, by2 = map(float, b)
+
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+
+        iw = max(0.0, inter_x2 - inter_x1 + 1.0)
+        ih = max(0.0, inter_y2 - inter_y1 + 1.0)
+        inter = iw * ih
+
+        area_a = max(0.0, ax2 - ax1 + 1.0) * max(0.0, ay2 - ay1 + 1.0)
+        area_b = max(0.0, bx2 - bx1 + 1.0) * max(0.0, by2 - by1 + 1.0)
+        union = area_a + area_b - inter
+
+        if union <= 1e-6:
+            return 0.0
+        return float(inter / union)
+
+    def _split_current_vs_confirmed(
+        self,
+        current_boxes: np.ndarray,
+        confirmed_boxes: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        current_boxes -> detections from current frame only
+        confirmed_boxes -> all historically confirmed candidates
+
+        Returns:
+            pending_current_boxes: current detections that do NOT overlap confirmed ones
+            confirmed_boxes: unchanged
+        """
+        if len(current_boxes) == 0:
+            return np.empty((0, 4), dtype=np.int32), confirmed_boxes
+
+        if len(confirmed_boxes) == 0:
+            return current_boxes.astype(np.int32, copy=False), confirmed_boxes
+
+        pending = []
+        thr = float(self.min_bbox_iou_gate)
+
+        for cur_box in current_boxes:
+            matched_confirmed = False
+            for conf_box in confirmed_boxes:
+                if self._bbox_iou_xyxy(cur_box, conf_box) >= thr:
+                    matched_confirmed = True
+                    break
+            if not matched_confirmed:
+                pending.append(np.asarray(cur_box, dtype=np.int32))
+
+        if not pending:
+            return np.empty((0, 4), dtype=np.int32), confirmed_boxes
+
+        return np.stack(pending, axis=0), confirmed_boxes
+
+    def _update_confirmed_store(
+        self,
+        camera_id: str,
+        ready_candidates: List[Any],
+    ) -> np.ndarray:
+        store = self.confirmed_by_camera.setdefault(camera_id, {})
+
+        for c in ready_candidates:
+            cand_id = getattr(c, "cand_id", None)
+            bbox = getattr(c, "bbox", None)
+            if cand_id is None or bbox is None:
+                continue
+            store[cand_id] = np.asarray(bbox, dtype=np.int32)
+
+        if not store:
+            return np.empty((0, 4), dtype=np.int32)
+
+        return np.stack(list(store.values()), axis=0)
+
     def _build_cd_tensor_1x9(
         self,
         empty_rgb01: np.ndarray,
@@ -314,11 +406,11 @@ class StorageViolationFrameProcessor:
         return float(a)
 
     def _infer_cd_mask01(
-            self,
-            empty_rgb01: np.ndarray,
-            recent_rgb01: np.ndarray,
-            cur_rgb01: np.ndarray,
-            camera_id: str,
+        self,
+        empty_rgb01: np.ndarray,
+        recent_rgb01: np.ndarray,
+        cur_rgb01: np.ndarray,
+        camera_id: str,
     ) -> np.ndarray:
         if cur_rgb01.ndim != 3 or cur_rgb01.shape[2] != 3:
             raise ValueError(f"cur_rgb01 must be HxWx3 float32, got {cur_rgb01.shape}")
@@ -355,11 +447,11 @@ class StorageViolationFrameProcessor:
         return sem.astype(np.float32, copy=False)
 
     def _init_camera_state_if_needed(
-            self,
-            camera_id: str,
-            frame_hw: Tuple[int, int],
-            ideal_bgr: np.ndarray,
-            now_mono: float,
+        self,
+        camera_id: str,
+        frame_hw: Tuple[int, int],
+        ideal_bgr: np.ndarray,
+        now_mono: float,
     ) -> None:
         if camera_id in self.camera_state:
             return
@@ -382,6 +474,7 @@ class StorageViolationFrameProcessor:
             recent_frame_i=0,
             recent_dt_accum=0.0,
         )
+        self.confirmed_by_camera[camera_id] = {}
         self._logger.info(f"[INIT] state created for camera={camera_id}")
 
     def _ensure_camera_initialized(
@@ -405,18 +498,6 @@ class StorageViolationFrameProcessor:
         if (ksize % 2) == 0:
             ksize += 1
         return cv2.GaussianBlur(rgb01, (ksize, ksize), 0)
-
-    @staticmethod
-    def _split_pending_and_reported(
-        snapshot_candidates: List[Any],
-        ready_candidates: List[Any],
-    ) -> Tuple[List[Any], List[Any]]:
-        ready_ids = {getattr(c, "cand_id", None) for c in ready_candidates}
-        pending_candidates = [
-            c for c in snapshot_candidates
-            if getattr(c, "cand_id", None) not in ready_ids
-        ]
-        return pending_candidates, ready_candidates
 
     def process_frame(
         self,
@@ -453,14 +534,16 @@ class StorageViolationFrameProcessor:
 
         alpha_used = self._update_recent(st=st, cur_rgb01=cur_rgb01, now_mono=now_mono)
 
+        confirmed_boxes = self._update_confirmed_store(camera_id, ready_candidates=[])
+
         if not self._should_detect(st, now_mono):
             return {
                 "detected": False,
-                "status": False,
-                "boxes": np.empty((0, 4), dtype=np.int32),
+                "status": len(confirmed_boxes) > 0,
+                "boxes": confirmed_boxes,
                 "candidate_boxes": np.empty((0, 4), dtype=np.int32),
                 "pending_candidate_boxes": np.empty((0, 4), dtype=np.int32),
-                "reported_boxes": np.empty((0, 4), dtype=np.int32),
+                "reported_boxes": confirmed_boxes,
                 "instance_masks": [],
                 "cd_mask01": None,
                 "fused_mask01": None,
@@ -469,8 +552,9 @@ class StorageViolationFrameProcessor:
                     "alpha_used": alpha_used,
                     "detect_started": st.detect_started,
                     "n_instances": 0,
-                    "snapshot_len": 0,
+                    "current_frame_boxes_len": 0,
                     "ready_len": 0,
+                    "confirmed_len": len(confirmed_boxes),
                     "skipped_by_delta": True,
                 },
             }
@@ -511,14 +595,18 @@ class StorageViolationFrameProcessor:
         )
 
         inst_masks = self._mask01_to_instances(fused01)
+        current_bboxes = [self._get_bbox(m) for m in inst_masks]
+        current_boxes = self._stack_boxes(current_bboxes)
 
         cq = self.queue_by_camera[camera_id]
-        bboxes = [self._get_bbox(m) for m in inst_masks]
-        snap, ready = cq.step(now=now_mono, current_masks=inst_masks, current_bboxes=bboxes)
+        snap, ready = cq.step(now=now_mono, current_masks=inst_masks, current_bboxes=current_bboxes)
 
-        pending_candidates, reported_candidates = self._split_pending_and_reported(snap, ready)
-        pending_candidate_boxes = self._extract_candidate_boxes(pending_candidates)
-        reported_boxes = self._extract_candidate_boxes(reported_candidates)
+        confirmed_boxes = self._update_confirmed_store(camera_id, ready_candidates=ready)
+
+        pending_candidate_boxes, reported_boxes = self._split_current_vs_confirmed(
+            current_boxes=current_boxes,
+            confirmed_boxes=confirmed_boxes,
+        )
 
         save_rt_panel(
             camera_id=camera_id,
@@ -534,17 +622,18 @@ class StorageViolationFrameProcessor:
         self._rt_iter_by_camera[camera_id] = self._rt_iter_by_camera.get(camera_id, 0) + 1
 
         self._logger.info(
-            f"[QUEUE] camera={camera_id} snapshot={len(snap)}, ready={len(ready)}, "
-            f"pending={len(pending_candidates)}, threshold_hits={self.threshold_hits}, "
-            f"drop_reported={self.drop_reported}"
+            f"[QUEUE] camera={camera_id} "
+            f"current={len(current_boxes)}, snapshot={len(snap)}, ready_now={len(ready)}, "
+            f"pending_current={len(pending_candidate_boxes)}, confirmed_total={len(reported_boxes)}, "
+            f"threshold_hits={self.threshold_hits}, drop_reported={self.drop_reported}"
         )
 
-        if len(reported_candidates) > 0 and hasattr(cq, "on_report"):
-            cq.on_report([c.cand_id for c in reported_candidates])
+        if len(ready) > 0 and hasattr(cq, "on_report"):
+            cq.on_report([c.cand_id for c in ready])
 
         return {
             "detected": True,
-            "status": len(reported_candidates) > 0,
+            "status": len(reported_boxes) > 0,
             "boxes": reported_boxes,
             "candidate_boxes": pending_candidate_boxes,
             "pending_candidate_boxes": pending_candidate_boxes,
@@ -557,9 +646,11 @@ class StorageViolationFrameProcessor:
                 "alpha_used": alpha_used,
                 "detect_started": st.detect_started,
                 "n_instances": len(inst_masks),
+                "current_frame_boxes_len": len(current_boxes),
                 "snapshot_len": len(snap),
                 "ready_len": len(ready),
-                "pending_len": len(pending_candidates),
+                "pending_current_len": len(pending_candidate_boxes),
+                "confirmed_len": len(reported_boxes),
                 "skipped_by_delta": False,
             },
         }
