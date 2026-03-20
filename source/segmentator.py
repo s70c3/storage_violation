@@ -209,14 +209,18 @@ class UNetVGG16Segmentator:
         if any(k.startswith("module.") for k in state.keys()):
             state = {k.replace("module.", "", 1): v for k, v in state.items()}
 
-        model.load_state_dict(state, strict=False)
-        model.eval().to(self._device)
+        missing, unexpected = model.load_state_dict(state, strict=True)
 
+        model.eval().to(self._device)
         if self.half and "cuda" in self._device:
             model.half()
 
         self._model = model
-        self._logger.info(f"[CD-MODEL] loaded weights={self._weights_path}")
+        self._logger.info(
+            f"[CD-MODEL] loaded weights={self.get_weights()} "
+            f"inp_ch={self.inp_ch} half={self.half} "
+            f"missing={len(missing)} unexpected={len(unexpected)}"
+        )
 
     @staticmethod
     def _pad_to_multiple(x: torch.Tensor, mult: int = 16):
