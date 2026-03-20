@@ -170,7 +170,6 @@ def delete_ideal(camera_id: str):
         "deleted": deleted,
     }
 
-
 @app.post("/process_frame")
 async def process_frame(
     camera_id: str = Form(...),
@@ -200,16 +199,27 @@ async def process_frame(
         polygons=polygons_np,
     )
 
-    boxes_np = result.get("boxes", np.empty((0, 4), dtype=np.int32))
-    boxes = boxes_np.astype(int).tolist() if len(boxes_np) > 0 else []
+    def boxes_to_list(value) -> list[list[int]]:
+        if value is None:
+            return []
+        if isinstance(value, np.ndarray):
+            return value.astype(int).tolist() if value.size > 0 else []
+        if isinstance(value, list):
+            return [[int(v) for v in box] for box in value]
+        return []
+
+    candidate_boxes = boxes_to_list(
+        result.get("candidate_boxes", result.get("pending_candidate_boxes"))
+    )
+    reported_boxes = boxes_to_list(result.get("reported_boxes", result.get("boxes")))
 
     return {
-        "detected": bool(result["detected"]),
-        "status": bool(result["status"]),
-        "boxes": boxes,
+        "detected": bool(result.get("detected", False)),
+        "status": bool(result.get("status", False)),
+        "candidate_boxes": candidate_boxes,
+        "reported_boxes": reported_boxes,
         "debug": result.get("debug", {}),
     }
-
 
 @app.post("/reset_camera/{camera_id}")
 def reset_camera(camera_id: str):
