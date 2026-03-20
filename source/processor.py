@@ -10,8 +10,8 @@ import cv2
 import numpy as np
 import torch
 
-from .queue_manager import CandidateQueueManager
 from .segmentator import SemanticSegmentatorProtocol
+from .tracker_manager import ByteTrackStationaryTracker
 from .visualization import save_rt_panel
 
 
@@ -19,29 +19,26 @@ from .visualization import save_rt_panel
 class CameraEMAState:
     empty_rgb01: np.ndarray
     recent_rgb01: np.ndarray
-
     last_ts_mono: float
     last_detect_mono: float
-
     detect_started: bool = False
-
     recent_frame_i: int = 0
     recent_dt_accum: float = 0.0
 
 
 class StorageViolationFrameProcessor:
     """
-    Returns:
-        - candidate_boxes / pending_candidate_boxes:
-            visible current detections that have NOT passed threshold yet (GREEN)
-        - reported_boxes / boxes:
-            visible current detections that HAVE passed threshold (RED)
+    candidate_boxes / pending_candidate_boxes:
+        visible now, but not stationary long enough yet (GREEN)
+
+    reported_boxes / boxes:
+        visible now and stationary long enough (RED)
     """
 
     def __init__(
         self,
         cd_segmentator: SemanticSegmentatorProtocol,
-        delta: int = 0,
+        delta: int = 2,
         ema_tau_sec: float = 5.0,
         ema_min_alpha: float = 0.02,
         ema_max_alpha: float = 0.12,
@@ -49,16 +46,14 @@ class StorageViolationFrameProcessor:
         thr: float = 0.5,
         min_side: int = 100,
         morph_ksize: int = 3,
-        threshold_hits: int = 10,
-        threshold_time_sec: float = 5.0,
-        expiration_time_sec: float = 30.0,
-        drop_reported: bool = False,
-        pad_factor: float = 0.2,
-        min_bbox_iou_gate: float = 0.3,
-        min_mask_iou: float = 0.6,
-        w_bbox: float = 0.5,
-        w_centroid: float = 0.3,
-        w_mask: float = 0.2,
+        stationary_time_sec: float = 5.0,
+        tracker_track_activation_threshold: float = 0.25,
+        tracker_lost_track_buffer: int = 30,
+        tracker_minimum_matching_threshold: float = 0.8,
+        tracker_frame_rate: int = 25,
+        tracker_minimum_consecutive_frames: int = 1,
+        tracker_max_center_shift_px: float = 20.0,
+        tracker_max_center_shift_norm: float = 0.08,
         recent_update_every: int = 10,
         logger: logging.Logger | None = None,
     ):
@@ -66,7 +61,7 @@ class StorageViolationFrameProcessor:
         self.delta = int(delta)
 
         self.camera_state: Dict[str, CameraEMAState] = {}
-        self.queue_by_camera: Dict[str, CandidateQueueManager] = {}
+        self.tracker_by_camera: Dict[str, ByteTrackStationaryTracker] = {}
 
         self.ema_tau_sec = float(ema_tau_sec)
         self.ema_min_alpha = float(ema_min_alpha)
@@ -78,17 +73,14 @@ class StorageViolationFrameProcessor:
         self.min_side = int(min_side)
         self.morph_ksize = int(morph_ksize)
 
-        self.threshold_hits = int(threshold_hits)
-        self.threshold_time_sec = float(threshold_time_sec)
-        self.expiration_time_sec = float(expiration_time_sec)
-        self.drop_reported = bool(drop_reported)
-
-        self.pad_factor = float(pad_factor)
-        self.min_bbox_iou_gate = float(min_bbox_iou_gate)
-        self.min_mask_iou = float(min_mask_iou)
-        self.w_bbox = float(w_bbox)
-        self.w_centroid = float(w_centroid)
-        self.w_mask = float(w_mask)
+        self.stationary_time_sec = float(stationary_time_sec)
+        self.tracker_track_activation_threshold = float(tracker_track_activation_threshold)
+        self.tracker_lost_track_buffer = int(tracker_lost_track_buffer)
+        self.tracker_minimum_matching_threshold = float(tracker_minimum_matching_threshold)
+        self.tracker_frame_rate = int(tracker_frame_rate)
+        self.tracker_minimum_consecutive_frames = int(tracker_minimum_consecutive_frames)
+        self.tracker_max_center_shift_px = float(tracker_max_center_shift_px)
+        self.tracker_max_center_shift_norm = float(tracker_max_center_shift_norm)
 
         self.recent_update_every = max(1, int(recent_update_every))
         self._rt_iter_by_camera: Dict[str, int] = {}
@@ -102,28 +94,23 @@ class StorageViolationFrameProcessor:
 
     def update_runtime_params(
         self,
-        threshold_hits: int | None = None,
-        threshold_time_sec: float | None = None,
         min_side: int | None = None,
+        stationary_time_sec: float | None = None,
     ) -> None:
-        if threshold_hits is not None:
-            self.threshold_hits = int(threshold_hits)
-
-        if threshold_time_sec is not None:
-            self.threshold_time_sec = float(threshold_time_sec)
-
         if min_side is not None:
             self.min_side = int(min_side)
 
+        if stationary_time_sec is not None:
+            self.stationary_time_sec = float(stationary_time_sec)
+
         self._logger.info(
-            f"[PARAM_UPDATE] threshold_hits={self.threshold_hits} "
-            f"threshold_time_sec={self.threshold_time_sec} "
-            f"min_side={self.min_side}"
+            f"[PARAM_UPDATE] min_side={self.min_side} "
+            f"stationary_time_sec={self.stationary_time_sec}"
         )
 
-        for camera_id in list(self.queue_by_camera.keys()):
-            self.queue_by_camera[camera_id] = self._make_queue_manager()
-            self._logger.info(f"[PARAM_UPDATE] queue reset for camera={camera_id}")
+        for camera_id in list(self.tracker_by_camera.keys()):
+            self.tracker_by_camera[camera_id] = self._make_tracker()
+            self._logger.info(f"[PARAM_UPDATE] tracker reset for camera={camera_id}")
 
     def load(self) -> None:
         self.cd_segmentator.load()
@@ -132,33 +119,32 @@ class StorageViolationFrameProcessor:
         if self.cd_segmentator is not None:
             self.cd_segmentator.close()
         self.camera_state.clear()
-        self.queue_by_camera.clear()
+        self.tracker_by_camera.clear()
         self._rt_iter_by_camera.clear()
 
     def reset_camera(self, camera_id: str) -> None:
         camera_id = str(camera_id)
         self.camera_state.pop(camera_id, None)
-        self.queue_by_camera.pop(camera_id, None)
+        self.tracker_by_camera.pop(camera_id, None)
         self._rt_iter_by_camera.pop(camera_id, None)
 
-    def _make_queue_manager(self) -> CandidateQueueManager:
-        return CandidateQueueManager(
-            threshold_hits=self.threshold_hits,
-            threshold_time_sec=self.threshold_time_sec,
-            expiration_time_sec=self.expiration_time_sec,
-            drop_reported=self.drop_reported,
-            pad_factor=self.pad_factor,
-            min_bbox_iou_gate=self.min_bbox_iou_gate,
-            min_mask_iou=self.min_mask_iou,
-            w_bbox=self.w_bbox,
-            w_centroid=self.w_centroid,
-            w_mask=self.w_mask,
+    def _make_tracker(self) -> ByteTrackStationaryTracker:
+        return ByteTrackStationaryTracker(
+            track_activation_threshold=self.tracker_track_activation_threshold,
+            lost_track_buffer=self.tracker_lost_track_buffer,
+            minimum_matching_threshold=self.tracker_minimum_matching_threshold,
+            frame_rate=self.tracker_frame_rate,
+            minimum_consecutive_frames=self.tracker_minimum_consecutive_frames,
+            stationary_time_sec=self.stationary_time_sec,
+            max_center_shift_px=self.tracker_max_center_shift_px,
+            max_center_shift_norm=self.tracker_max_center_shift_norm,
+            logger=self._logger,
         )
 
-    def _ensure_camera_queue(self, camera_id: str) -> None:
-        if camera_id not in self.queue_by_camera:
-            self.queue_by_camera[camera_id] = self._make_queue_manager()
-            self._logger.info(f"[INIT] queue created for camera={camera_id}")
+    def _ensure_camera_tracker(self, camera_id: str) -> None:
+        if camera_id not in self.tracker_by_camera:
+            self.tracker_by_camera[camera_id] = self._make_tracker()
+            self._logger.info(f"[INIT] tracker created for camera={camera_id}")
 
     def _should_detect(self, st: CameraEMAState, now_mono: float) -> bool:
         if (now_mono - st.last_detect_mono) >= float(self.delta):
@@ -249,75 +235,6 @@ class StorageViolationFrameProcessor:
         y_min, x_min = coords.min(axis=0)
         y_max, x_max = coords.max(axis=0)
         return np.array([x_min, y_min, x_max, y_max], dtype=np.float32)
-
-    @staticmethod
-    def _stack_boxes(boxes: List[np.ndarray]) -> np.ndarray:
-        if not boxes:
-            return np.empty((0, 4), dtype=np.int32)
-        return np.stack([np.asarray(b, dtype=np.int32) for b in boxes], axis=0)
-
-    @staticmethod
-    def _bbox_iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
-        ax1, ay1, ax2, ay2 = map(float, a)
-        bx1, by1, bx2, by2 = map(float, b)
-
-        inter_x1 = max(ax1, bx1)
-        inter_y1 = max(ay1, by1)
-        inter_x2 = min(ax2, bx2)
-        inter_y2 = min(ay2, by2)
-
-        iw = max(0.0, inter_x2 - inter_x1)
-        ih = max(0.0, inter_y2 - inter_y1)
-        inter = iw * ih
-
-        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-        union = area_a + area_b - inter
-
-        if union <= 1e-6:
-            return 0.0
-        return float(inter / union)
-
-    def _split_current_into_green_and_red(
-        self,
-        current_boxes: np.ndarray,
-        stable_boxes: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        GREEN: current detections that have NOT passed threshold yet
-        RED:   current detections that HAVE passed threshold
-        """
-        if len(current_boxes) == 0:
-            return (
-                np.empty((0, 4), dtype=np.int32),
-                stable_boxes.astype(np.int32, copy=False),
-            )
-
-        if len(stable_boxes) == 0:
-            return (
-                current_boxes.astype(np.int32, copy=False),
-                np.empty((0, 4), dtype=np.int32),
-            )
-
-        green_boxes = []
-        thr = float(self.min_bbox_iou_gate)
-
-        for cur_box in current_boxes:
-            matched_stable = False
-            for stable_box in stable_boxes:
-                if self._bbox_iou_xyxy(cur_box, stable_box) >= thr:
-                    matched_stable = True
-                    break
-            if not matched_stable:
-                green_boxes.append(np.asarray(cur_box, dtype=np.int32))
-
-        if green_boxes:
-            green_boxes = np.stack(green_boxes, axis=0)
-        else:
-            green_boxes = np.empty((0, 4), dtype=np.int32)
-
-        red_boxes = stable_boxes.astype(np.int32, copy=False)
-        return green_boxes, red_boxes
 
     def _build_cd_tensor_1x9(
         self,
@@ -437,7 +354,7 @@ class StorageViolationFrameProcessor:
         now_mono: float,
     ) -> None:
         self._init_camera_state_if_needed(camera_id, frame_hw, ideal_bgr, now_mono)
-        self._ensure_camera_queue(camera_id)
+        self._ensure_camera_tracker(camera_id)
 
     def gamma_rgb01(self, x: np.ndarray, gamma: float = 0.8) -> np.ndarray:
         x = np.clip(x, 0.0, 1.0)
@@ -502,9 +419,8 @@ class StorageViolationFrameProcessor:
                     "alpha_used": alpha_used,
                     "detect_started": st.detect_started,
                     "n_instances": 0,
-                    "current_frame_boxes_len": 0,
-                    "ready_len": 0,
-                    "pending_current_len": 0,
+                    "candidate_len": 0,
+                    "reported_len": 0,
                     "skipped_by_delta": True,
                 },
             }
@@ -518,7 +434,7 @@ class StorageViolationFrameProcessor:
         empty_rgb01 = self._blur_rgb01(empty_rgb01, ksize=3)
 
         recent_rgb01_for_cd = self.gamma_rgb01(recent_rgb01_for_cd, 0.8)
-        blur_size = (recent_rgb01_for_cd.shape[1] // 40) | 1
+        blur_size = max(3, (recent_rgb01_for_cd.shape[1] // 40) | 1)
         recent_blur = self._blur_rgb01(recent_rgb01_for_cd, ksize=blur_size)
         recent_rgb01_for_cd = (
             (1.0 - self.min_empty_weight) * recent_blur
@@ -547,24 +463,12 @@ class StorageViolationFrameProcessor:
 
         inst_masks = self._mask01_to_instances(fused01)
         current_bboxes = [self._get_bbox(m) for m in inst_masks]
-        current_boxes = self._stack_boxes(current_bboxes)
 
-        cq = self.queue_by_camera[camera_id]
-        snap, ready = cq.step(
+        tracker = self.tracker_by_camera[camera_id]
+        candidate_boxes, reported_boxes = tracker.update(
             now=now_mono,
-            current_masks=inst_masks,
             current_bboxes=current_bboxes,
-        )
-
-        stable_boxes = (
-            np.array([np.asarray(c.bbox, dtype=np.int32) for c in ready], dtype=np.int32)
-            if ready
-            else np.empty((0, 4), dtype=np.int32)
-        )
-
-        candidate_boxes, reported_boxes = self._split_current_into_green_and_red(
-            current_boxes=current_boxes,
-            stable_boxes=stable_boxes,
+            current_masks=inst_masks,
         )
 
         save_rt_panel(
@@ -574,21 +478,17 @@ class StorageViolationFrameProcessor:
             recent_rgb01=recent_rgb01_for_cd,
             cur_rgb01=cur_rgb01,
             cd_mask01=cd_mask01,
-            pending_boxes=candidate_boxes,   # GREEN in visualization below
-            reported_boxes=reported_boxes,   # RED in visualization below
+            candidate_boxes=candidate_boxes,
+            reported_boxes=reported_boxes,
             logger=self._logger,
         )
         self._rt_iter_by_camera[camera_id] = self._rt_iter_by_camera.get(camera_id, 0) + 1
 
         self._logger.info(
-            f"[QUEUE] camera={camera_id} "
-            f"current={len(current_boxes)}, snapshot={len(snap)}, stable_now={len(ready)}, "
-            f"candidate_now={len(candidate_boxes)}, "
-            f"threshold_hits={self.threshold_hits}, drop_reported={self.drop_reported}"
+            f"[TRACK] camera={camera_id} "
+            f"current={len(current_bboxes)} candidate_now={len(candidate_boxes)} "
+            f"reported_now={len(reported_boxes)} stationary_time_sec={self.stationary_time_sec}"
         )
-
-        if len(ready) > 0 and hasattr(cq, "on_report"):
-            cq.on_report([c.cand_id for c in ready])
 
         return {
             "detected": True,
@@ -605,9 +505,7 @@ class StorageViolationFrameProcessor:
                 "alpha_used": alpha_used,
                 "detect_started": st.detect_started,
                 "n_instances": len(inst_masks),
-                "current_frame_boxes_len": len(current_boxes),
-                "snapshot_len": len(snap),
-                "ready_len": len(ready),
+                "current_frame_boxes_len": len(current_bboxes),
                 "candidate_len": len(candidate_boxes),
                 "reported_len": len(reported_boxes),
                 "skipped_by_delta": False,

@@ -9,12 +9,8 @@ CAMERA_ID = "cam_1"
 IDEAL_IMAGE_PATH = "data/ideal.png"
 VIDEO_PATH = "data/video1.avi"
 
-# Можно поставить None, если полигон не нужен
 POLYGONS = None
-# Отправлять не каждый кадр, а, например, каждый 3-й
 SEND_EVERY_N_FRAMES = 1
-
-# Таймаут запроса
 REQUEST_TIMEOUT = 60
 
 
@@ -51,6 +47,7 @@ def send_frame(api_url: str, camera_id: str, frame_bgr, polygons=None):
     resp.raise_for_status()
     return resp.json()
 
+
 def draw_result(frame_bgr, result: dict):
     vis = frame_bgr.copy()
 
@@ -61,7 +58,7 @@ def draw_result(frame_bgr, result: dict):
     candidate_boxes = result.get("candidate_boxes", [])
     reported_boxes = result.get("reported_boxes", result.get("boxes", []))
 
-    # Зеленые: текущие, но еще не прошли threshold
+    # Зеленые: видны сейчас, но еще не стоят достаточно долго
     for box in candidate_boxes:
         x1, y1, x2, y2 = map(int, box)
         cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -76,7 +73,7 @@ def draw_result(frame_bgr, result: dict):
             cv2.LINE_AA,
         )
 
-    # Красные: уже прошли threshold
+    # Красные: стоят уже достаточно долго
     for box in reported_boxes:
         x1, y1, x2, y2 = map(int, box)
         cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 255), 3)
@@ -97,7 +94,8 @@ def draw_result(frame_bgr, result: dict):
     )
     text2 = (
         f"n_inst={debug.get('n_instances', 0)} "
-        f"ready={debug.get('ready_len', 0)} "
+        f"cand_dbg={debug.get('candidate_len', 0)} "
+        f"rep_dbg={debug.get('reported_len', 0)} "
         f"alpha={debug.get('alpha_used', 0):.4f}"
     )
 
@@ -106,6 +104,7 @@ def draw_result(frame_bgr, result: dict):
 
     return vis
 
+
 def main():
     upload_ideal(API_URL, CAMERA_ID, IDEAL_IMAGE_PATH)
 
@@ -113,10 +112,9 @@ def main():
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {VIDEO_PATH}")
 
-    # --- параметры видео ---
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0:
-        fps = 25  # fallback
+        fps = 25
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -133,6 +131,8 @@ def main():
         "detected": False,
         "status": False,
         "boxes": [],
+        "candidate_boxes": [],
+        "reported_boxes": [],
         "debug": {},
     }
 
@@ -156,14 +156,13 @@ def main():
                 print(f"Request failed on frame {frame_idx}: {e}")
 
         vis = draw_result(frame, last_result)
-
-        # --- запись вместо показа ---
         writer.write(vis)
 
     cap.release()
     writer.release()
 
     print("[INFO] Done. Video saved.")
+
 
 if __name__ == "__main__":
     main()

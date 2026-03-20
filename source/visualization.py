@@ -104,7 +104,7 @@ def save_rt_panel(
     recent_rgb01: np.ndarray,
     cur_rgb01: np.ndarray,
     cd_mask01: np.ndarray,
-    pending_boxes: np.ndarray | list,
+    candidate_boxes: np.ndarray | list,
     reported_boxes: np.ndarray | list,
     logger: logging.Logger | None = None,
     out_dir: str | Path = "/tmp/rt_tests",
@@ -119,20 +119,22 @@ def save_rt_panel(
         cur_bgr = rgb01_to_bgr_u8(cur_rgb01)
         cd_bgr = mask01_to_bgr_u8(cd_mask01)
 
-        cur_bgr_boxed = draw_boxes(cur_bgr, pending_boxes, color=(0, 0, 255), thickness=2)
-        cur_bgr_boxed = draw_boxes(cur_bgr_boxed, reported_boxes, color=(0, 255, 0), thickness=2)
+        # GREEN = not stationary yet
+        # RED = stationary long enough
+        cur_bgr_boxed = draw_boxes(cur_bgr, candidate_boxes, color=(0, 255, 0), thickness=2)
+        cur_bgr_boxed = draw_boxes(cur_bgr_boxed, reported_boxes, color=(0, 0, 255), thickness=2)
 
-        cd_bgr_boxed = draw_boxes(cd_bgr, pending_boxes, color=(0, 0, 255), thickness=2)
-        cd_bgr_boxed = draw_boxes(cd_bgr_boxed, reported_boxes, color=(0, 255, 0), thickness=2)
+        cd_bgr_boxed = draw_boxes(cd_bgr, candidate_boxes, color=(0, 255, 0), thickness=2)
+        cd_bgr_boxed = draw_boxes(cd_bgr_boxed, reported_boxes, color=(0, 0, 255), thickness=2)
 
         overlay_bgr = make_overlay(ideal_bgr, cur_bgr, alpha=0.5)
-        overlay_bgr_boxed = draw_boxes(overlay_bgr, pending_boxes, color=(0, 0, 255), thickness=2)
-        overlay_bgr_boxed = draw_boxes(overlay_bgr_boxed, reported_boxes, color=(0, 255, 0), thickness=2)
+        overlay_bgr_boxed = draw_boxes(overlay_bgr, candidate_boxes, color=(0, 255, 0), thickness=2)
+        overlay_bgr_boxed = draw_boxes(overlay_bgr_boxed, reported_boxes, color=(0, 0, 255), thickness=2)
 
         tiles = [
             put_label(ideal_bgr, "ideal"),
             put_label(recent_bgr, "recent"),
-            put_label(cur_bgr_boxed, f"current (pending={len(pending_boxes)}, reported={len(reported_boxes)})"),
+            put_label(cur_bgr_boxed, f"current (green={len(candidate_boxes)}, red={len(reported_boxes)})"),
             put_label(cd_bgr_boxed, "cd"),
             put_label(overlay_bgr_boxed, "ideal + current"),
             np.full_like(ideal_bgr, 20),
