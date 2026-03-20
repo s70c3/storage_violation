@@ -118,14 +118,19 @@ class UNetUp(nn.Module):
 
 
 class ConvSig(nn.Module):
-    def __init__(self, in_ch: int):
-        super().__init__()
-        self.out = nn.Sequential(
-            nn.Conv2d(in_ch, 1, 1),
-            nn.Sigmoid(),
-        )
+    """ Conv layer + Sigmoid
 
-    def forward(self, inp: torch.Tensor) -> torch.Tensor:
+    Args:
+        in_ch (int): Number of input channels
+    """
+
+    def __init__(self, in_ch):
+        super(ConvSig, self).__init__()
+        self.out = nn.Sequential()
+        self.out.add_module("conv2d", nn.Conv2d(in_ch, 1, 1))
+        self.out.add_module("sigmoid", nn.Sigmoid())
+
+    def forward(self, inp):
         return self.out(inp)
 
 
