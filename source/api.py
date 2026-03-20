@@ -22,7 +22,7 @@ if not LOGGER.handlers:
 MODEL_WEIGHTS_PATH = "weights/cd_weights.pt"
 MODEL_DEVICE = "cuda:0"   # e.g. "cuda:0"
 MODEL_THRESHOLD = 0.5
-MODEL_HALF = False
+MODEL_HALF = True
 MODEL_INP_CH = 9
 
 PROCESSOR_KWARGS = dict(
