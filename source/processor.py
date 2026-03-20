@@ -435,6 +435,8 @@ class StorageViolationFrameProcessor:
         now_mono: Optional[float] = None,
         frame_obj: Any = None,
     ) -> dict:
+        t0 = time.perf_counter()
+
         if frame_bgr is None:
             raise ValueError("frame_bgr is None")
         if ideal_bgr is None:
@@ -487,6 +489,8 @@ class StorageViolationFrameProcessor:
         alpha_used = self._update_recent(st=st, cur_rgb01=cur_rgb01, now_mono=now_mono)
 
         if not self._should_detect(st, now_mono):
+            frame_time_sec = time.perf_counter() - t0
+            frame_time_ms = frame_time_sec * 1000.0
             return {
                 "detected": False,
                 "status": False,
@@ -508,6 +512,8 @@ class StorageViolationFrameProcessor:
                     "resize_scale": resize_scale,
                     "processed_hw": (h, w),
                     "original_hw": (original_h, original_w),
+                    "frame_time_sec": frame_time_sec,
+                    "frame_time_ms": frame_time_ms,
                 },
             }
 
@@ -557,24 +563,27 @@ class StorageViolationFrameProcessor:
             current_masks=inst_masks,
         )
 
-        save_rt_panel(
-            camera_id=camera_id,
-            iter_idx=self._rt_iter_by_camera.get(camera_id, 0) + 1,
-            empty_rgb01=empty_rgb01,
-            recent_rgb01=recent_rgb01_for_cd,
-            cur_rgb01=cur_rgb01,
-            cd_mask01=cd_mask01,
-            candidate_boxes=candidate_boxes,
-            reported_boxes=reported_boxes,
-            logger=self._logger,
-        )
-        self._rt_iter_by_camera[camera_id] = self._rt_iter_by_camera.get(camera_id, 0) + 1
+        # save_rt_panel(
+        #     camera_id=camera_id,
+        #     iter_idx=self._rt_iter_by_camera.get(camera_id, 0) + 1,
+        #     empty_rgb01=empty_rgb01,
+        #     recent_rgb01=recent_rgb01_for_cd,
+        #     cur_rgb01=cur_rgb01,
+        #     cd_mask01=cd_mask01,
+        #     candidate_boxes=candidate_boxes,
+        #     reported_boxes=reported_boxes,
+        #     logger=self._logger,
+        # )
+        # self._rt_iter_by_camera[camera_id] = self._rt_iter_by_camera.get(camera_id, 0) + 1
 
         self._logger.info(
             f"[TRACK] camera={camera_id} "
             f"current={len(current_bboxes)} candidate_now={len(candidate_boxes)} "
             f"reported_now={len(reported_boxes)} stationary_time_sec={self.stationary_time_sec}"
         )
+
+        frame_time_sec = time.perf_counter() - t0
+        frame_time_ms = frame_time_sec * 1000.0
 
         return {
             "detected": True,
@@ -596,5 +605,7 @@ class StorageViolationFrameProcessor:
                 "resize_scale": resize_scale,
                 "processed_hw": (h, w),
                 "original_hw": (original_h, original_w),
+                "frame_time_sec": frame_time_sec,
+                "frame_time_ms": frame_time_ms,
             },
         }
