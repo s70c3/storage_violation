@@ -222,7 +222,7 @@ class UNetVGG16Segmentator:
 
         self._model = model
         self._logger.info(
-            f"[CD-MODEL] loaded weights={self.get_weights()} "
+            f"[CD-MODEL] loaded weights={self._weights_path} "
             f"inp_ch={self.inp_ch} half={self.half} "
             f"missing={len(missing)} unexpected={len(unexpected)}"
         )
