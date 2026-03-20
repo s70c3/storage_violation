@@ -51,7 +51,6 @@ def send_frame(api_url: str, camera_id: str, frame_bgr, polygons=None):
     resp.raise_for_status()
     return resp.json()
 
-
 def draw_result(frame_bgr, result: dict):
     vis = frame_bgr.copy()
 
@@ -62,32 +61,32 @@ def draw_result(frame_bgr, result: dict):
     candidate_boxes = result.get("candidate_boxes", [])
     reported_boxes = result.get("reported_boxes", result.get("boxes", []))
 
-    # Красные: кандидаты
+    # Зеленые: текущие, но еще не прошли threshold
     for box in candidate_boxes:
         x1, y1, x2, y2 = map(int, box)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.putText(
             vis,
             "candidate",
             (x1, max(20, y1 - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
-            (0, 0, 255),
+            (0, 255, 0),
             2,
             cv2.LINE_AA,
         )
 
-    # Зеленые: подтвержденные оставленные
+    # Красные: уже прошли threshold
     for box in reported_boxes:
         x1, y1, x2, y2 = map(int, box)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 255), 3)
         cv2.putText(
             vis,
             "reported",
             (x1, max(20, y1 - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
-            (0, 255, 0),
+            (0, 0, 255),
             2,
             cv2.LINE_AA,
         )

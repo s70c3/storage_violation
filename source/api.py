@@ -26,9 +26,10 @@ MODEL_HALF = True
 MODEL_INP_CH = 9
 
 PROCESSOR_KWARGS = dict(
-    threshold_hits=1,
-    threshold_time_sec=5.0,
-    min_side=10
+    threshold_hits=10,
+    threshold_time_sec=0,
+    min_side=10,
+    delta = 0
 )
 
 

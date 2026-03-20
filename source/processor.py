@@ -31,22 +31,17 @@ class CameraEMAState:
 
 class StorageViolationFrameProcessor:
     """
-    Independent per-frame processor.
-
-    Main public method:
-        process_frame(camera_id, frame_bgr, ideal_bgr, polygons=None, frame_obj=None)
-
     Returns:
-        - pending_candidate_boxes: boxes detected on current frame, but not yet ready
-        - reported_boxes: boxes detected on current frame and already passed queue threshold
-        - candidate_boxes: alias of pending_candidate_boxes
-        - boxes: alias of reported_boxes
+        - candidate_boxes / pending_candidate_boxes:
+            visible current detections that have NOT passed threshold yet (GREEN)
+        - reported_boxes / boxes:
+            visible current detections that HAVE passed threshold (RED)
     """
 
     def __init__(
         self,
         cd_segmentator: SemanticSegmentatorProtocol,
-        delta: int = 2,
+        delta: int = 0,
         ema_tau_sec: float = 5.0,
         ema_min_alpha: float = 0.02,
         ema_max_alpha: float = 0.12,
@@ -283,40 +278,46 @@ class StorageViolationFrameProcessor:
             return 0.0
         return float(inter / union)
 
-    def _split_current_ready_vs_pending(
+    def _split_current_into_green_and_red(
         self,
         current_boxes: np.ndarray,
-        ready_boxes: np.ndarray,
+        stable_boxes: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Splits current detections into:
-        - pending_current_boxes: current detections that are NOT ready yet
-        - ready_boxes: current detections that already passed queue threshold
-
-        Matching is done by IoU against ready boxes from current frame.
+        GREEN: current detections that have NOT passed threshold yet
+        RED:   current detections that HAVE passed threshold
         """
         if len(current_boxes) == 0:
-            return np.empty((0, 4), dtype=np.int32), ready_boxes
+            return (
+                np.empty((0, 4), dtype=np.int32),
+                stable_boxes.astype(np.int32, copy=False),
+            )
 
-        if len(ready_boxes) == 0:
-            return current_boxes.astype(np.int32, copy=False), ready_boxes
+        if len(stable_boxes) == 0:
+            return (
+                current_boxes.astype(np.int32, copy=False),
+                np.empty((0, 4), dtype=np.int32),
+            )
 
-        pending = []
+        green_boxes = []
         thr = float(self.min_bbox_iou_gate)
 
         for cur_box in current_boxes:
-            matched_ready = False
-            for ready_box in ready_boxes:
-                if self._bbox_iou_xyxy(cur_box, ready_box) >= thr:
-                    matched_ready = True
+            matched_stable = False
+            for stable_box in stable_boxes:
+                if self._bbox_iou_xyxy(cur_box, stable_box) >= thr:
+                    matched_stable = True
                     break
-            if not matched_ready:
-                pending.append(np.asarray(cur_box, dtype=np.int32))
+            if not matched_stable:
+                green_boxes.append(np.asarray(cur_box, dtype=np.int32))
 
-        if not pending:
-            return np.empty((0, 4), dtype=np.int32), ready_boxes
+        if green_boxes:
+            green_boxes = np.stack(green_boxes, axis=0)
+        else:
+            green_boxes = np.empty((0, 4), dtype=np.int32)
 
-        return np.stack(pending, axis=0), ready_boxes
+        red_boxes = stable_boxes.astype(np.int32, copy=False)
+        return green_boxes, red_boxes
 
     def _build_cd_tensor_1x9(
         self,
@@ -555,15 +556,15 @@ class StorageViolationFrameProcessor:
             current_bboxes=current_bboxes,
         )
 
-        reported_boxes = (
+        stable_boxes = (
             np.array([np.asarray(c.bbox, dtype=np.int32) for c in ready], dtype=np.int32)
             if ready
             else np.empty((0, 4), dtype=np.int32)
         )
 
-        pending_candidate_boxes, reported_boxes = self._split_current_ready_vs_pending(
+        candidate_boxes, reported_boxes = self._split_current_into_green_and_red(
             current_boxes=current_boxes,
-            ready_boxes=reported_boxes,
+            stable_boxes=stable_boxes,
         )
 
         save_rt_panel(
@@ -573,16 +574,16 @@ class StorageViolationFrameProcessor:
             recent_rgb01=recent_rgb01_for_cd,
             cur_rgb01=cur_rgb01,
             cd_mask01=cd_mask01,
-            pending_boxes=pending_candidate_boxes,
-            reported_boxes=reported_boxes,
+            pending_boxes=candidate_boxes,   # GREEN in visualization below
+            reported_boxes=reported_boxes,   # RED in visualization below
             logger=self._logger,
         )
         self._rt_iter_by_camera[camera_id] = self._rt_iter_by_camera.get(camera_id, 0) + 1
 
         self._logger.info(
             f"[QUEUE] camera={camera_id} "
-            f"current={len(current_boxes)}, snapshot={len(snap)}, ready_now={len(ready)}, "
-            f"pending_current={len(pending_candidate_boxes)}, "
+            f"current={len(current_boxes)}, snapshot={len(snap)}, stable_now={len(ready)}, "
+            f"candidate_now={len(candidate_boxes)}, "
             f"threshold_hits={self.threshold_hits}, drop_reported={self.drop_reported}"
         )
 
@@ -591,10 +592,10 @@ class StorageViolationFrameProcessor:
 
         return {
             "detected": True,
-            "status": len(reported_boxes) > 0,
+            "status": (len(candidate_boxes) > 0 or len(reported_boxes) > 0),
             "boxes": reported_boxes,
-            "candidate_boxes": pending_candidate_boxes,
-            "pending_candidate_boxes": pending_candidate_boxes,
+            "candidate_boxes": candidate_boxes,
+            "pending_candidate_boxes": candidate_boxes,
             "reported_boxes": reported_boxes,
             "instance_masks": inst_masks,
             "cd_mask01": cd_mask01,
@@ -607,7 +608,8 @@ class StorageViolationFrameProcessor:
                 "current_frame_boxes_len": len(current_boxes),
                 "snapshot_len": len(snap),
                 "ready_len": len(ready),
-                "pending_current_len": len(pending_candidate_boxes),
+                "candidate_len": len(candidate_boxes),
+                "reported_len": len(reported_boxes),
                 "skipped_by_delta": False,
             },
         }
