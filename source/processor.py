@@ -167,59 +167,66 @@ class StorageViolationFrameProcessor:
         return bgr_u8[..., ::-1].astype(np.float32) / 255.0
 
     @staticmethod
-    def _resize_image_if_needed(
-        image: np.ndarray,
-        max_long_side: int,
-        interpolation: int,
-    ) -> tuple[np.ndarray, float]:
-        h, w = image.shape[:2]
+    def _resize_rgb01_to_hw(
+        rgb01: np.ndarray,
+        target_hw: Tuple[int, int],
+    ) -> np.ndarray:
+        th, tw = target_hw
+        h, w = rgb01.shape[:2]
+
+        if (h, w) == (th, tw):
+            return rgb01.astype(np.float32, copy=False)
+
+        return cv2.resize(
+            rgb01,
+            (tw, th),
+            interpolation=cv2.INTER_LINEAR,
+        ).astype(np.float32, copy=False)
+
+    def _resize_triplet_for_model(
+        self,
+        empty_rgb01: np.ndarray,
+        recent_rgb01: np.ndarray,
+        cur_rgb01: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int], float]:
+        """
+        Приводит empty/recent к размеру cur.
+        Если длинная сторона cur больше max_long_side, уменьшает все 3 изображения
+        только для модели. Возвращает:
+            empty_model, recent_model, cur_model, orig_hw, resize_scale
+        """
+        orig_hw = cur_rgb01.shape[:2]
+
+        empty_rgb01 = self._resize_rgb01_to_hw(empty_rgb01, orig_hw)
+        recent_rgb01 = self._resize_rgb01_to_hw(recent_rgb01, orig_hw)
+
+        h, w = orig_hw
         long_side = max(h, w)
 
-        if long_side <= max_long_side:
-            return image, 1.0
+        if long_side <= self.max_long_side:
+            return (
+                empty_rgb01.astype(np.float32, copy=False),
+                recent_rgb01.astype(np.float32, copy=False),
+                cur_rgb01.astype(np.float32, copy=False),
+                orig_hw,
+                1.0,
+            )
 
-        scale = float(max_long_side) / float(long_side)
+        scale = float(self.max_long_side) / float(long_side)
         new_w = max(1, int(round(w * scale)))
         new_h = max(1, int(round(h * scale)))
-        resized = cv2.resize(image, (new_w, new_h), interpolation=interpolation)
-        return resized, scale
 
-    @staticmethod
-    def _scale_polygons(
-        polygons: Optional[List[np.ndarray]],
-        scale: float,
-    ) -> Optional[List[np.ndarray]]:
-        if polygons is None or scale == 1.0:
-            return polygons
+        empty_small = cv2.resize(
+            empty_rgb01, (new_w, new_h), interpolation=cv2.INTER_AREA
+        ).astype(np.float32, copy=False)
+        recent_small = cv2.resize(
+            recent_rgb01, (new_w, new_h), interpolation=cv2.INTER_AREA
+        ).astype(np.float32, copy=False)
+        cur_small = cv2.resize(
+            cur_rgb01, (new_w, new_h), interpolation=cv2.INTER_AREA
+        ).astype(np.float32, copy=False)
 
-        out: List[np.ndarray] = []
-        for polygon in polygons:
-            pts = np.asarray(polygon, dtype=np.float32)
-            if pts.ndim != 2 or pts.shape[1] != 2:
-                continue
-            pts = np.round(pts * scale).astype(np.int32)
-            out.append(pts)
-        return out
-
-    @staticmethod
-    def _scale_human_boxes_in_frame_obj(frame_obj: Any, scale: float) -> None:
-        if frame_obj is None or scale == 1.0:
-            return
-
-        raw_humans = getattr(frame_obj, "raw_humans", None)
-        raw_human_boxes = getattr(raw_humans, "boxes", None) if raw_humans is not None else None
-        if raw_human_boxes is None:
-            return
-
-        scaled_boxes = []
-        for box in raw_human_boxes:
-            b = np.asarray(box, dtype=np.float32)
-            if b.shape[-1] != 4:
-                scaled_boxes.append(box)
-                continue
-            b *= scale
-            scaled_boxes.append(np.round(b).astype(np.int32))
-        raw_humans.boxes = scaled_boxes
+        return empty_small, recent_small, cur_small, orig_hw, scale
 
     def _build_zone_mask_u8(
         self,
@@ -343,36 +350,62 @@ class StorageViolationFrameProcessor:
         if cur_rgb01.ndim != 3 or cur_rgb01.shape[2] != 3:
             raise ValueError(f"cur_rgb01 must be HxWx3 float32, got {cur_rgb01.shape}")
 
-        exp_hw = (cur_rgb01.shape[0], cur_rgb01.shape[1])
-        x = self._build_cd_tensor_1x9(empty_rgb01, recent_rgb01, cur_rgb01)
+        empty_model, recent_model, cur_model, orig_hw, resize_scale = self._resize_triplet_for_model(
+            empty_rgb01=empty_rgb01,
+            recent_rgb01=recent_rgb01,
+            cur_rgb01=cur_rgb01,
+        )
+
+        exp_hw_model = cur_model.shape[:2]
+
+        if resize_scale != 1.0:
+            self._logger.info(
+                f"[MODEL_RESIZE] camera={camera_id} "
+                f"orig_hw={orig_hw} model_hw={exp_hw_model} scale={resize_scale:.4f}"
+            )
+
+        x = self._build_cd_tensor_1x9(empty_model, recent_model, cur_model)
 
         pred_fn = getattr(self.cd_segmentator, "predict_semantic01", None)
         if callable(pred_fn):
             sem01 = pred_fn(x, {"camera_id": camera_id})
             sem01 = np.asarray(sem01, dtype=np.float32)
 
-            if sem01.shape != exp_hw:
+            if sem01.shape != exp_hw_model:
                 self._logger.warning(
-                    f"[CD] predict_semantic01 bad shape={sem01.shape}, expected={exp_hw}"
+                    f"[CD] predict_semantic01 bad shape={sem01.shape}, expected={exp_hw_model}"
                 )
-                return np.zeros(exp_hw, np.float32)
+                return np.zeros(orig_hw, np.float32)
+        else:
+            cd_res = self.cd_segmentator([x], {"camera_id": camera_id})
+            if not cd_res:
+                return np.zeros(orig_hw, np.float32)
 
-            return sem01
+            bm = getattr(cd_res[0], "binary_masks", None)
+            masks = [] if (bm is None or bm.masks is None) else (bm.masks or [])
+            if not masks:
+                return np.zeros(orig_hw, np.float32)
 
-        cd_res = self.cd_segmentator([x], {"camera_id": camera_id})
-        if not cd_res:
-            return np.zeros(exp_hw, np.float32)
+            sem = np.zeros(exp_hw_model, dtype=bool)
+            for m in masks:
+                sem |= np.asarray(m, dtype=bool)
 
-        bm = getattr(cd_res[0], "binary_masks", None)
-        masks = [] if (bm is None or bm.masks is None) else (bm.masks or [])
-        if not masks:
-            return np.zeros(exp_hw, np.float32)
+            sem01 = sem.astype(np.float32, copy=False)
 
-        sem = np.zeros(exp_hw, dtype=bool)
-        for m in masks:
-            sem |= np.asarray(m, dtype=bool)
+        if resize_scale != 1.0:
+            sem01 = cv2.resize(
+                sem01,
+                (orig_hw[1], orig_hw[0]),
+                interpolation=cv2.INTER_LINEAR,
+            ).astype(np.float32, copy=False)
 
-        return sem.astype(np.float32, copy=False)
+        if sem01.shape != orig_hw:
+            self._logger.warning(
+                f"[CD] final mask shape mismatch after resize_back: got={sem01.shape}, expected={orig_hw}"
+            )
+            return np.zeros(orig_hw, np.float32)
+
+        return sem01
 
     def _init_camera_state_if_needed(
         self,
@@ -448,29 +481,10 @@ class StorageViolationFrameProcessor:
         camera_id = str(camera_id)
 
         original_h, original_w = frame_bgr.shape[:2]
+        resize_scale = 1.0
 
-        cur_bgr, resize_scale = self._resize_image_if_needed(
-            np.ascontiguousarray(frame_bgr),
-            max_long_side=self.max_long_side,
-            interpolation=cv2.INTER_AREA,
-        )
-
-        if resize_scale != 1.0:
-            ideal_bgr, _ = self._resize_image_if_needed(
-                np.ascontiguousarray(ideal_bgr),
-                max_long_side=self.max_long_side,
-                interpolation=cv2.INTER_AREA,
-            )
-            polygons = self._scale_polygons(polygons, resize_scale)
-            self._scale_human_boxes_in_frame_obj(frame_obj, resize_scale)
-
-            self._logger.info(
-                f"[RESIZE] camera={camera_id} "
-                f"orig_hw=({original_h},{original_w}) resized_hw={cur_bgr.shape[:2]} "
-                f"scale={resize_scale:.4f}"
-            )
-        else:
-            ideal_bgr = np.ascontiguousarray(ideal_bgr)
+        cur_bgr = np.ascontiguousarray(frame_bgr)
+        ideal_bgr = np.ascontiguousarray(ideal_bgr)
 
         h, w = cur_bgr.shape[:2]
         cur_rgb01 = self._bgr_u8_to_rgb01(cur_bgr)
@@ -602,8 +616,6 @@ class StorageViolationFrameProcessor:
                 "candidate_len": len(candidate_boxes),
                 "reported_len": len(reported_boxes),
                 "skipped_by_delta": False,
-                "resize_scale": resize_scale,
-                "processed_hw": (h, w),
                 "original_hw": (original_h, original_w),
                 "frame_time_sec": frame_time_sec,
                 "frame_time_ms": frame_time_ms,
