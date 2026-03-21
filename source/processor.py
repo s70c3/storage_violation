@@ -33,6 +33,9 @@ class StorageViolationFrameProcessor:
 
     reported_boxes / boxes:
         visible now and stationary long enough (RED)
+
+    All internal processing is done in resized resolution.
+    If long side > max_long_side, frame and ideal are resized to that limit.
     """
 
     def __init__(
@@ -55,6 +58,7 @@ class StorageViolationFrameProcessor:
         tracker_max_center_shift_px: float = 20.0,
         tracker_max_center_shift_norm: float = 0.08,
         recent_update_every: int = 10,
+        max_long_side: int = 640,
         logger: logging.Logger | None = None,
     ):
         self.cd_segmentator = cd_segmentator
@@ -83,7 +87,10 @@ class StorageViolationFrameProcessor:
         self.tracker_max_center_shift_norm = float(tracker_max_center_shift_norm)
 
         self.recent_update_every = max(1, int(recent_update_every))
+        self.max_long_side = int(max_long_side)
+
         self._rt_iter_by_camera: Dict[str, int] = {}
+        self._prepared_empty_cache: Dict[Tuple[str, int, int], np.ndarray] = {}
 
         self._logger = logger or logging.getLogger("StorageViolationProcessor")
         if not self._logger.handlers:
@@ -96,6 +103,7 @@ class StorageViolationFrameProcessor:
         self,
         min_side: int | None = None,
         stationary_time_sec: float | None = None,
+        max_long_side: int | None = None,
     ) -> None:
         if min_side is not None:
             self.min_side = int(min_side)
@@ -103,9 +111,18 @@ class StorageViolationFrameProcessor:
         if stationary_time_sec is not None:
             self.stationary_time_sec = float(stationary_time_sec)
 
+        if max_long_side is not None:
+            self.max_long_side = int(max_long_side)
+            self.camera_state.clear()
+            self.tracker_by_camera.clear()
+            self._rt_iter_by_camera.clear()
+            self._prepared_empty_cache.clear()
+            self._logger.info("[PARAM_UPDATE] camera states reset because max_long_side changed")
+
         self._logger.info(
             f"[PARAM_UPDATE] min_side={self.min_side} "
-            f"stationary_time_sec={self.stationary_time_sec}"
+            f"stationary_time_sec={self.stationary_time_sec} "
+            f"max_long_side={self.max_long_side}"
         )
 
         for camera_id in list(self.tracker_by_camera.keys()):
@@ -121,12 +138,17 @@ class StorageViolationFrameProcessor:
         self.camera_state.clear()
         self.tracker_by_camera.clear()
         self._rt_iter_by_camera.clear()
+        self._prepared_empty_cache.clear()
 
     def reset_camera(self, camera_id: str) -> None:
         camera_id = str(camera_id)
         self.camera_state.pop(camera_id, None)
         self.tracker_by_camera.pop(camera_id, None)
         self._rt_iter_by_camera.pop(camera_id, None)
+
+        keys_to_drop = [k for k in self._prepared_empty_cache.keys() if k[0] == camera_id]
+        for k in keys_to_drop:
+            self._prepared_empty_cache.pop(k, None)
 
     def _make_tracker(self) -> ByteTrackStationaryTracker:
         return ByteTrackStationaryTracker(
@@ -162,6 +184,53 @@ class StorageViolationFrameProcessor:
     @staticmethod
     def _bgr_u8_to_rgb01(bgr_u8: np.ndarray) -> np.ndarray:
         return bgr_u8[..., ::-1].astype(np.float32) / 255.0
+
+    @staticmethod
+    def _resize_bgr_if_needed(
+        bgr: np.ndarray,
+        max_long_side: int,
+    ) -> tuple[np.ndarray, float]:
+        h, w = bgr.shape[:2]
+        long_side = max(h, w)
+
+        if max_long_side <= 0 or long_side <= max_long_side:
+            return np.ascontiguousarray(bgr), 1.0
+
+        scale = float(max_long_side) / float(long_side)
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+
+        resized = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        return np.ascontiguousarray(resized), scale
+
+    @staticmethod
+    def _resize_polygon(
+        polygon: np.ndarray,
+        scale: float,
+    ) -> np.ndarray:
+        if scale == 1.0:
+            return np.asarray(polygon, dtype=np.float32)
+        return np.asarray(polygon, dtype=np.float32) * float(scale)
+
+    @staticmethod
+    def _scale_box_xyxy(
+        box: np.ndarray | list | tuple,
+        scale: float,
+        target_hw: tuple[int, int],
+    ) -> np.ndarray:
+        x1, y1, x2, y2 = map(float, np.asarray(box).tolist())
+        if scale != 1.0:
+            x1 *= scale
+            y1 *= scale
+            x2 *= scale
+            y2 *= scale
+
+        h, w = target_hw
+        x1 = int(np.clip(round(x1), 0, w))
+        y1 = int(np.clip(round(y1), 0, h))
+        x2 = int(np.clip(round(x2), 0, w))
+        y2 = int(np.clip(round(y2), 0, h))
+        return np.array([x1, y1, x2, y2], dtype=np.int32)
 
     def _build_zone_mask_u8(
         self,
@@ -316,6 +385,27 @@ class StorageViolationFrameProcessor:
 
         return sem.astype(np.float32, copy=False)
 
+    def _prepare_empty_rgb01(
+        self,
+        camera_id: str,
+        ideal_bgr: np.ndarray,
+        target_hw: tuple[int, int],
+    ) -> np.ndarray:
+        cache_key = (camera_id, target_hw[0], target_hw[1])
+        cached = self._prepared_empty_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        ih, iw = ideal_bgr.shape[:2]
+        th, tw = target_hw
+
+        if (ih, iw) != (th, tw):
+            ideal_bgr = cv2.resize(ideal_bgr, (tw, th), interpolation=cv2.INTER_AREA)
+
+        empty_rgb01 = self._bgr_u8_to_rgb01(np.ascontiguousarray(ideal_bgr))
+        self._prepared_empty_cache[cache_key] = empty_rgb01
+        return empty_rgb01
+
     def _init_camera_state_if_needed(
         self,
         camera_id: str,
@@ -326,14 +416,11 @@ class StorageViolationFrameProcessor:
         if camera_id in self.camera_state:
             return
 
-        h, w = frame_hw
-        empty_rgb01 = self._bgr_u8_to_rgb01(ideal_bgr)
-
-        if empty_rgb01.shape[:2] != (h, w):
-            raise ValueError(
-                f"ideal/frame size mismatch for camera={camera_id}: "
-                f"ideal={empty_rgb01.shape[:2]} frame={(h, w)}"
-            )
+        empty_rgb01 = self._prepare_empty_rgb01(
+            camera_id=camera_id,
+            ideal_bgr=ideal_bgr,
+            target_hw=frame_hw,
+        )
 
         self.camera_state[camera_id] = CameraEMAState(
             empty_rgb01=empty_rgb01,
@@ -344,7 +431,9 @@ class StorageViolationFrameProcessor:
             recent_frame_i=0,
             recent_dt_accum=0.0,
         )
-        self._logger.info(f"[INIT] state created for camera={camera_id}")
+        self._logger.info(
+            f"[INIT] state created for camera={camera_id}, hw={frame_hw}"
+        )
 
     def _ensure_camera_initialized(
         self,
@@ -386,19 +475,52 @@ class StorageViolationFrameProcessor:
             now_mono = time.monotonic()
 
         camera_id = str(camera_id)
-        cur_bgr = np.ascontiguousarray(frame_bgr)
+
+        # ------------------------------------------------------------------
+        # EARLIEST POSSIBLE FAST RESIZE
+        # Everything after this point works only in resized resolution.
+        # ------------------------------------------------------------------
+        cur_bgr, resize_scale = self._resize_bgr_if_needed(
+            np.ascontiguousarray(frame_bgr),
+            self.max_long_side,
+        )
         h, w = cur_bgr.shape[:2]
+
+        if resize_scale != 1.0:
+            ideal_bgr_resized = cv2.resize(ideal_bgr, (w, h), interpolation=cv2.INTER_AREA)
+            ideal_bgr_resized = np.ascontiguousarray(ideal_bgr_resized)
+
+            polygons_resized = None
+            if polygons is not None:
+                polygons_resized = [
+                    self._resize_polygon(np.asarray(p, dtype=np.float32), resize_scale)
+                    for p in polygons
+                ]
+
+            if frame_obj is not None:
+                raw_humans = getattr(frame_obj, "raw_humans", None)
+                raw_human_boxes = getattr(raw_humans, "boxes", None) if raw_humans is not None else None
+                if raw_human_boxes is not None:
+                    scaled_boxes = [
+                        self._scale_box_xyxy(box, resize_scale, (h, w))
+                        for box in raw_human_boxes
+                    ]
+                    raw_humans.boxes = scaled_boxes
+        else:
+            ideal_bgr_resized = np.ascontiguousarray(ideal_bgr)
+            polygons_resized = polygons
+
         cur_rgb01 = self._bgr_u8_to_rgb01(cur_bgr)
 
         self._ensure_camera_initialized(
             camera_id=camera_id,
             frame_hw=(h, w),
-            ideal_bgr=ideal_bgr,
+            ideal_bgr=ideal_bgr_resized,
             now_mono=now_mono,
         )
         st = self.camera_state[camera_id]
 
-        zone_mask_u8 = self._build_zone_mask_u8((h, w), polygons, frame_obj=frame_obj)
+        zone_mask_u8 = self._build_zone_mask_u8((h, w), polygons_resized, frame_obj=frame_obj)
         zone_bool = zone_mask_u8 > 0
 
         alpha_used = self._update_recent(st=st, cur_rgb01=cur_rgb01, now_mono=now_mono)
@@ -422,6 +544,9 @@ class StorageViolationFrameProcessor:
                     "candidate_len": 0,
                     "reported_len": 0,
                     "skipped_by_delta": True,
+                    "resize_scale": resize_scale,
+                    "processed_hw": [h, w],
+                    "original_hw": list(frame_bgr.shape[:2]),
                 },
             }
 
@@ -458,7 +583,8 @@ class StorageViolationFrameProcessor:
         fused01 *= zone_bool.astype(np.float32)
 
         self._logger.info(
-            f"[FUSE] camera={camera_id} cd_sum={cd_mask01.sum():.1f}, fused_sum={fused01.sum():.1f}"
+            f"[FUSE] camera={camera_id} cd_sum={cd_mask01.sum():.1f}, "
+            f"fused_sum={fused01.sum():.1f}, resize_scale={resize_scale:.4f}, hw={(h, w)}"
         )
 
         inst_masks = self._mask01_to_instances(fused01)
@@ -507,5 +633,8 @@ class StorageViolationFrameProcessor:
                 "candidate_len": len(candidate_boxes),
                 "reported_len": len(reported_boxes),
                 "skipped_by_delta": False,
+                "resize_scale": resize_scale,
+                "processed_hw": [h, w],
+                "original_hw": list(frame_bgr.shape[:2]),
             },
         }
