@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
+from .demo_pipeline import run_demo_video, run_demo_video_named
 from .ideal_storage import IdealImageStorage
 from .processor import StorageViolationFrameProcessor
 from .segmentator import UNetVGG16Segmentator
-from .schemas import RuntimeParamsRequest, RuntimeParamsResponse
 
 LOGGER = logging.getLogger("storage_violation_api")
 if not LOGGER.handlers:
@@ -214,11 +218,16 @@ async def process_frame(
     )
     reported_boxes = boxes_to_list(result.get("reported_boxes", result.get("boxes")))
 
+    cand_ids = result.get("candidate_track_ids") or []
+    rep_ids = result.get("reported_track_ids") or []
+
     return {
         "detected": bool(result.get("detected", False)),
         "status": bool(result.get("status", False)),
         "candidate_boxes": candidate_boxes,
         "reported_boxes": reported_boxes,
+        "candidate_track_ids": [int(x) for x in cand_ids],
+        "reported_track_ids": [int(x) for x in rep_ids],
         "debug": result.get("debug", {}),
     }
 
@@ -228,29 +237,104 @@ def reset_camera(camera_id: str):
     processor.reset_camera(camera_id)
     return {"status": "ok", "camera_id": camera_id}
 
-@app.get("/params", response_model=RuntimeParamsResponse)
-def get_params():
-    processor: StorageViolationFrameProcessor = app.state.processor
 
-    return RuntimeParamsResponse(
-        threshold_hits=processor.threshold_hits,
-        threshold_time_sec=processor.threshold_time_sec,
-        min_side=processor.min_side,
+def _unlink_temp(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+@app.get("/demo/process_data_video", summary="Демо: пары ideal+video из /app/data → MP4 с боксами")
+async def demo_process_data_video(
+    duration_sec: float = Query(
+        10.0,
+        ge=-1.0,
+        description="Секунд с начала ролика; -1 = весь файл до конца",
+    ),
+    preset: int = Query(
+        1,
+        ge=1,
+        le=4,
+        description="1=ideal+video1, 2=ofis_big, 3=ofis_small, 4=ideal2+video2",
+    ),
+):
+    """
+    Тестовый эндпоинт: читает выбранную пару файлов из каталога демо (см. ``DATA_DIR`` в ``demo_pipeline.py``),
+    прогоняет пайплайн без HTTP к самому себе, возвращает выходное MP4.
+    """
+    processor: StorageViolationFrameProcessor = app.state.processor
+    ideal_storage: IdealImageStorage = app.state.ideal_storage
+
+    try:
+        out_path = await run_in_threadpool(
+            run_demo_video,
+            processor,
+            ideal_storage,
+            duration_sec,
+            preset,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    return FileResponse(
+        out_path,
+        media_type="video/mp4",
+        filename="demo_output.mp4",
+        background=BackgroundTask(_unlink_temp, out_path),
     )
 
-@app.post("/params", response_model=RuntimeParamsResponse)
-def update_params(payload: RuntimeParamsRequest):
 
+@app.get(
+    "/demo/process_data_video_by_names",
+    summary="Демо: свои имена ideal и video в каталоге демо → MP4",
+)
+async def demo_process_data_video_by_names(
+    ideal_name: str = Query(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="Имя файла ideal в каталоге демо (/app/data в Docker), напр. ofis_small.png",
+    ),
+    video_name: str = Query(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="Имя файла видео в каталоге демо",
+    ),
+    duration_sec: float = Query(
+        10.0,
+        ge=-1.0,
+        description="Секунд с начала; -1 = весь файл",
+    ),
+):
+    """Файлы ищутся только в каталоге демо (см. ``DATA_DIR`` в ``demo_pipeline.py``), без подпапок."""
     processor: StorageViolationFrameProcessor = app.state.processor
+    ideal_storage: IdealImageStorage = app.state.ideal_storage
 
-    processor.update_runtime_params(
-        threshold_hits=payload.threshold_hits,
-        threshold_time_sec=payload.threshold_time_sec,
-        min_side=payload.min_side,
-    )
+    try:
+        out_path = await run_in_threadpool(
+            run_demo_video_named,
+            processor,
+            ideal_storage,
+            duration_sec,
+            ideal_name,
+            video_name,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
-    return RuntimeParamsResponse(
-        threshold_hits=processor.threshold_hits,
-        threshold_time_sec=processor.threshold_time_sec,
-        min_side=processor.min_side,
+    return FileResponse(
+        out_path,
+        media_type="video/mp4",
+        filename="demo_output.mp4",
+        background=BackgroundTask(_unlink_temp, out_path),
     )
