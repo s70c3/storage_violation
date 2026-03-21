@@ -457,6 +457,10 @@ class StorageViolationFrameProcessor:
             ksize += 1
         return cv2.GaussianBlur(rgb01, (ksize, ksize), 0)
 
+    @staticmethod
+    def _ms(t0: float, t1: float) -> float:
+        return round((t1 - t0) * 1000.0, 3)
+
     def process_frame(
         self,
         camera_id: str,
@@ -466,6 +470,8 @@ class StorageViolationFrameProcessor:
         now_mono: Optional[float] = None,
         frame_obj: Any = None,
     ) -> dict:
+        t_total_0 = time.perf_counter()
+
         if frame_bgr is None:
             raise ValueError("frame_bgr is None")
         if ideal_bgr is None:
@@ -475,11 +481,12 @@ class StorageViolationFrameProcessor:
             now_mono = time.monotonic()
 
         camera_id = str(camera_id)
+        timings_ms: Dict[str, float] = {}
 
         # ------------------------------------------------------------------
-        # EARLIEST POSSIBLE FAST RESIZE
-        # Everything after this point works only in resized resolution.
+        # EARLY RESIZE
         # ------------------------------------------------------------------
+        t0 = time.perf_counter()
         cur_bgr, resize_scale = self._resize_bgr_if_needed(
             np.ascontiguousarray(frame_bgr),
             self.max_long_side,
@@ -511,7 +518,13 @@ class StorageViolationFrameProcessor:
             polygons_resized = polygons
 
         cur_rgb01 = self._bgr_u8_to_rgb01(cur_bgr)
+        t1 = time.perf_counter()
+        timings_ms["resize_prepare"] = self._ms(t0, t1)
 
+        # ------------------------------------------------------------------
+        # INIT
+        # ------------------------------------------------------------------
+        t0 = time.perf_counter()
         self._ensure_camera_initialized(
             camera_id=camera_id,
             frame_hw=(h, w),
@@ -519,13 +532,49 @@ class StorageViolationFrameProcessor:
             now_mono=now_mono,
         )
         st = self.camera_state[camera_id]
+        t1 = time.perf_counter()
+        timings_ms["init"] = self._ms(t0, t1)
 
+        # ------------------------------------------------------------------
+        # ZONE MASK
+        # ------------------------------------------------------------------
+        t0 = time.perf_counter()
         zone_mask_u8 = self._build_zone_mask_u8((h, w), polygons_resized, frame_obj=frame_obj)
         zone_bool = zone_mask_u8 > 0
+        t1 = time.perf_counter()
+        timings_ms["zone_mask"] = self._ms(t0, t1)
 
+        # ------------------------------------------------------------------
+        # RECENT UPDATE
+        # ------------------------------------------------------------------
+        t0 = time.perf_counter()
         alpha_used = self._update_recent(st=st, cur_rgb01=cur_rgb01, now_mono=now_mono)
+        t1 = time.perf_counter()
+        timings_ms["update_recent"] = self._ms(t0, t1)
 
-        if not self._should_detect(st, now_mono):
+        # ------------------------------------------------------------------
+        # DELTA GATE
+        # ------------------------------------------------------------------
+        t0 = time.perf_counter()
+        should_detect = self._should_detect(st, now_mono)
+        t1 = time.perf_counter()
+        timings_ms["delta_gate"] = self._ms(t0, t1)
+
+        if not should_detect:
+            t_total_1 = time.perf_counter()
+            timings_ms["total"] = self._ms(t_total_0, t_total_1)
+
+            self._logger.info(
+                f"[TIMING] camera={camera_id} "
+                f"total={timings_ms['total']:.3f}ms "
+                f"resize_prepare={timings_ms['resize_prepare']:.3f} "
+                f"init={timings_ms['init']:.3f} "
+                f"zone_mask={timings_ms['zone_mask']:.3f} "
+                f"update_recent={timings_ms['update_recent']:.3f} "
+                f"delta_gate={timings_ms['delta_gate']:.3f} "
+                f"skipped_by_delta=1"
+            )
+
             return {
                 "detected": False,
                 "status": False,
@@ -547,9 +596,14 @@ class StorageViolationFrameProcessor:
                     "resize_scale": resize_scale,
                     "processed_hw": [h, w],
                     "original_hw": list(frame_bgr.shape[:2]),
+                    "timings_ms": timings_ms,
                 },
             }
 
+        # ------------------------------------------------------------------
+        # PREPROCESS FOR CD
+        # ------------------------------------------------------------------
+        t0 = time.perf_counter()
         recent_rgb01_for_cd = (
             (1.0 - self.min_empty_weight) * st.recent_rgb01
             + self.min_empty_weight * st.empty_rgb01
@@ -568,35 +622,65 @@ class StorageViolationFrameProcessor:
 
         cur_rgb01_proc = self.gamma_rgb01(cur_rgb01, 0.8)
         cur_rgb01_proc = self._blur_rgb01(cur_rgb01_proc, ksize=3)
+        t1 = time.perf_counter()
+        timings_ms["preprocess_cd_inputs"] = self._ms(t0, t1)
 
+        # ------------------------------------------------------------------
+        # INFERENCE
+        # ------------------------------------------------------------------
+        t0 = time.perf_counter()
         cd_mask01 = self._infer_cd_mask01(
             empty_rgb01,
             recent_rgb01_for_cd,
             cur_rgb01_proc,
             camera_id,
         )
+        t1 = time.perf_counter()
+        timings_ms["infer_cd"] = self._ms(t0, t1)
 
+        # ------------------------------------------------------------------
+        # FUSE
+        # ------------------------------------------------------------------
+        t0 = time.perf_counter()
         if not st.detect_started:
             st.detect_started = True
 
         fused01 = cd_mask01.copy()
         fused01 *= zone_bool.astype(np.float32)
+        t1 = time.perf_counter()
+        timings_ms["fuse"] = self._ms(t0, t1)
 
         self._logger.info(
             f"[FUSE] camera={camera_id} cd_sum={cd_mask01.sum():.1f}, "
             f"fused_sum={fused01.sum():.1f}, resize_scale={resize_scale:.4f}, hw={(h, w)}"
         )
 
+        # ------------------------------------------------------------------
+        # POSTPROCESS MASK -> INSTANCES -> BBOXES
+        # ------------------------------------------------------------------
+        t0 = time.perf_counter()
         inst_masks = self._mask01_to_instances(fused01)
         current_bboxes = [self._get_bbox(m) for m in inst_masks]
+        t1 = time.perf_counter()
+        timings_ms["postprocess_instances"] = self._ms(t0, t1)
 
+        # ------------------------------------------------------------------
+        # TRACKER
+        # ------------------------------------------------------------------
+        t0 = time.perf_counter()
         tracker = self.tracker_by_camera[camera_id]
         candidate_boxes, reported_boxes = tracker.update(
             now=now_mono,
             current_bboxes=current_bboxes,
             current_masks=inst_masks,
         )
+        t1 = time.perf_counter()
+        timings_ms["tracker"] = self._ms(t0, t1)
 
+        # ------------------------------------------------------------------
+        # VISUALIZATION
+        # ------------------------------------------------------------------
+        t0 = time.perf_counter()
         save_rt_panel(
             camera_id=camera_id,
             iter_idx=self._rt_iter_by_camera.get(camera_id, 0) + 1,
@@ -609,11 +693,32 @@ class StorageViolationFrameProcessor:
             logger=self._logger,
         )
         self._rt_iter_by_camera[camera_id] = self._rt_iter_by_camera.get(camera_id, 0) + 1
+        t1 = time.perf_counter()
+        timings_ms["visualization"] = self._ms(t0, t1)
+
+        t_total_1 = time.perf_counter()
+        timings_ms["total"] = self._ms(t_total_0, t_total_1)
 
         self._logger.info(
             f"[TRACK] camera={camera_id} "
             f"current={len(current_bboxes)} candidate_now={len(candidate_boxes)} "
             f"reported_now={len(reported_boxes)} stationary_time_sec={self.stationary_time_sec}"
+        )
+
+        self._logger.info(
+            f"[TIMING] camera={camera_id} "
+            f"total={timings_ms['total']:.3f}ms "
+            f"resize_prepare={timings_ms['resize_prepare']:.3f} "
+            f"init={timings_ms['init']:.3f} "
+            f"zone_mask={timings_ms['zone_mask']:.3f} "
+            f"update_recent={timings_ms['update_recent']:.3f} "
+            f"delta_gate={timings_ms['delta_gate']:.3f} "
+            f"preprocess_cd_inputs={timings_ms['preprocess_cd_inputs']:.3f} "
+            f"infer_cd={timings_ms['infer_cd']:.3f} "
+            f"fuse={timings_ms['fuse']:.3f} "
+            f"postprocess_instances={timings_ms['postprocess_instances']:.3f} "
+            f"tracker={timings_ms['tracker']:.3f} "
+            f"visualization={timings_ms['visualization']:.3f}"
         )
 
         return {
@@ -636,5 +741,6 @@ class StorageViolationFrameProcessor:
                 "resize_scale": resize_scale,
                 "processed_hw": [h, w],
                 "original_hw": list(frame_bgr.shape[:2]),
+                "timings_ms": timings_ms,
             },
         }
