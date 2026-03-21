@@ -39,5 +39,4 @@ http://localhost:8000/docs
 
 Файл `process_video.py` содержит тестовый скрипт, который позволяет проверить на видео. 
 
-
-_NB! сейчас всё конфигурировано для cpu и может работать медленно._ 
+``` python3 process_video.py --ideal-image data/ofis_big.png --video data/ofis_big.mp4```
