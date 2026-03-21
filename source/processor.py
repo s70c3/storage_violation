@@ -36,6 +36,9 @@ class StorageViolationFrameProcessor:
 
     All internal processing is done in resized resolution.
     If long side > max_long_side, frame and ideal are resized to that limit.
+
+    Returned candidate_boxes / reported_boxes are rescaled back
+    to the original frame resolution for external display/use.
     """
 
     def __init__(
@@ -226,6 +229,31 @@ class StorageViolationFrameProcessor:
             y2 *= scale
 
         h, w = target_hw
+        x1 = int(np.clip(round(x1), 0, w))
+        y1 = int(np.clip(round(y1), 0, h))
+        x2 = int(np.clip(round(x2), 0, w))
+        y2 = int(np.clip(round(y2), 0, h))
+        return np.array([x1, y1, x2, y2], dtype=np.int32)
+
+    @staticmethod
+    def _rescale_box_xyxy_to_original(
+        box: np.ndarray | list | tuple,
+        scale: float,
+        original_hw: tuple[int, int],
+    ) -> np.ndarray:
+        x1, y1, x2, y2 = map(float, np.asarray(box).tolist())
+
+        if scale <= 0:
+            raise ValueError(f"scale must be > 0, got {scale}")
+
+        if scale != 1.0:
+            inv_scale = 1.0 / float(scale)
+            x1 *= inv_scale
+            y1 *= inv_scale
+            x2 *= inv_scale
+            y2 *= inv_scale
+
+        h, w = original_hw
         x1 = int(np.clip(round(x1), 0, w))
         y1 = int(np.clip(round(y1), 0, h))
         x2 = int(np.clip(round(x2), 0, w))
@@ -477,15 +505,14 @@ class StorageViolationFrameProcessor:
         if ideal_bgr is None:
             raise ValueError("ideal_bgr is None")
 
+        orig_h, orig_w = frame_bgr.shape[:2]
+
         if now_mono is None:
             now_mono = time.monotonic()
 
         camera_id = str(camera_id)
         timings_ms: Dict[str, float] = {}
 
-        # ------------------------------------------------------------------
-        # EARLY RESIZE
-        # ------------------------------------------------------------------
         t0 = time.perf_counter()
         cur_bgr, resize_scale = self._resize_bgr_if_needed(
             np.ascontiguousarray(frame_bgr),
@@ -521,9 +548,6 @@ class StorageViolationFrameProcessor:
         t1 = time.perf_counter()
         timings_ms["resize_prepare"] = self._ms(t0, t1)
 
-        # ------------------------------------------------------------------
-        # INIT
-        # ------------------------------------------------------------------
         t0 = time.perf_counter()
         self._ensure_camera_initialized(
             camera_id=camera_id,
@@ -535,26 +559,17 @@ class StorageViolationFrameProcessor:
         t1 = time.perf_counter()
         timings_ms["init"] = self._ms(t0, t1)
 
-        # ------------------------------------------------------------------
-        # ZONE MASK
-        # ------------------------------------------------------------------
         t0 = time.perf_counter()
         zone_mask_u8 = self._build_zone_mask_u8((h, w), polygons_resized, frame_obj=frame_obj)
         zone_bool = zone_mask_u8 > 0
         t1 = time.perf_counter()
         timings_ms["zone_mask"] = self._ms(t0, t1)
 
-        # ------------------------------------------------------------------
-        # RECENT UPDATE
-        # ------------------------------------------------------------------
         t0 = time.perf_counter()
         alpha_used = self._update_recent(st=st, cur_rgb01=cur_rgb01, now_mono=now_mono)
         t1 = time.perf_counter()
         timings_ms["update_recent"] = self._ms(t0, t1)
 
-        # ------------------------------------------------------------------
-        # DELTA GATE
-        # ------------------------------------------------------------------
         t0 = time.perf_counter()
         should_detect = self._should_detect(st, now_mono)
         t1 = time.perf_counter()
@@ -595,14 +610,11 @@ class StorageViolationFrameProcessor:
                     "skipped_by_delta": True,
                     "resize_scale": resize_scale,
                     "processed_hw": [h, w],
-                    "original_hw": list(frame_bgr.shape[:2]),
+                    "original_hw": [orig_h, orig_w],
                     "timings_ms": timings_ms,
                 },
             }
 
-        # ------------------------------------------------------------------
-        # PREPROCESS FOR CD
-        # ------------------------------------------------------------------
         t0 = time.perf_counter()
         recent_rgb01_for_cd = (
             (1.0 - self.min_empty_weight) * st.recent_rgb01
@@ -625,9 +637,6 @@ class StorageViolationFrameProcessor:
         t1 = time.perf_counter()
         timings_ms["preprocess_cd_inputs"] = self._ms(t0, t1)
 
-        # ------------------------------------------------------------------
-        # INFERENCE
-        # ------------------------------------------------------------------
         t0 = time.perf_counter()
         cd_mask01 = self._infer_cd_mask01(
             empty_rgb01,
@@ -638,9 +647,6 @@ class StorageViolationFrameProcessor:
         t1 = time.perf_counter()
         timings_ms["infer_cd"] = self._ms(t0, t1)
 
-        # ------------------------------------------------------------------
-        # FUSE
-        # ------------------------------------------------------------------
         t0 = time.perf_counter()
         if not st.detect_started:
             st.detect_started = True
@@ -655,31 +661,31 @@ class StorageViolationFrameProcessor:
             f"fused_sum={fused01.sum():.1f}, resize_scale={resize_scale:.4f}, hw={(h, w)}"
         )
 
-        # ------------------------------------------------------------------
-        # POSTPROCESS MASK -> INSTANCES -> BBOXES
-        # ------------------------------------------------------------------
         t0 = time.perf_counter()
         inst_masks = self._mask01_to_instances(fused01)
         current_bboxes = [self._get_bbox(m) for m in inst_masks]
         t1 = time.perf_counter()
         timings_ms["postprocess_instances"] = self._ms(t0, t1)
 
-        # ------------------------------------------------------------------
-        # TRACKER
-        # ------------------------------------------------------------------
         t0 = time.perf_counter()
         tracker = self.tracker_by_camera[camera_id]
-        candidate_boxes, reported_boxes = tracker.update(
+        candidate_boxes_resized, reported_boxes_resized = tracker.update(
             now=now_mono,
             current_bboxes=current_bboxes,
             current_masks=inst_masks,
         )
+
+        candidate_boxes = [
+            self._rescale_box_xyxy_to_original(box, resize_scale, (orig_h, orig_w))
+            for box in candidate_boxes_resized
+        ]
+        reported_boxes = [
+            self._rescale_box_xyxy_to_original(box, resize_scale, (orig_h, orig_w))
+            for box in reported_boxes_resized
+        ]
         t1 = time.perf_counter()
         timings_ms["tracker"] = self._ms(t0, t1)
 
-        # ------------------------------------------------------------------
-        # VISUALIZATION
-        # ------------------------------------------------------------------
         t0 = time.perf_counter()
         save_rt_panel(
             camera_id=camera_id,
@@ -688,8 +694,8 @@ class StorageViolationFrameProcessor:
             recent_rgb01=recent_rgb01_for_cd,
             cur_rgb01=cur_rgb01,
             cd_mask01=cd_mask01,
-            candidate_boxes=candidate_boxes,
-            reported_boxes=reported_boxes,
+            candidate_boxes=candidate_boxes_resized,
+            reported_boxes=reported_boxes_resized,
             logger=self._logger,
         )
         self._rt_iter_by_camera[camera_id] = self._rt_iter_by_camera.get(camera_id, 0) + 1
@@ -740,7 +746,9 @@ class StorageViolationFrameProcessor:
                 "skipped_by_delta": False,
                 "resize_scale": resize_scale,
                 "processed_hw": [h, w],
-                "original_hw": list(frame_bgr.shape[:2]),
+                "original_hw": [orig_h, orig_w],
+                "candidate_boxes_resized": [np.asarray(b, dtype=np.int32).tolist() for b in candidate_boxes_resized],
+                "reported_boxes_resized": [np.asarray(b, dtype=np.int32).tolist() for b in reported_boxes_resized],
                 "timings_ms": timings_ms,
             },
         }
