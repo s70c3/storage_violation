@@ -621,10 +621,10 @@ class StorageViolationFrameProcessor:
             + self.min_empty_weight * st.empty_rgb01
         )
 
-        empty_rgb01 = self.gamma_rgb01(st.empty_rgb01, 0.8)
-        empty_rgb01 = self._blur_rgb01(empty_rgb01, ksize=3)
+        # empty_rgb01 = self.gamma_rgb01(st.empty_rgb01, 0.8)
+        empty_rgb01 = self._blur_rgb01(st.empty_rgb01, ksize=3)
 
-        recent_rgb01_for_cd = self.gamma_rgb01(recent_rgb01_for_cd, 0.8)
+        # recent_rgb01_for_cd = self.gamma_rgb01(recent_rgb01_for_cd, 0.8)
         blur_size = max(3, (recent_rgb01_for_cd.shape[1] // 40) | 1)
         recent_blur = self._blur_rgb01(recent_rgb01_for_cd, ksize=blur_size)
         recent_rgb01_for_cd = (
@@ -632,8 +632,8 @@ class StorageViolationFrameProcessor:
             + self.min_empty_weight * st.empty_rgb01
         )
 
-        cur_rgb01_proc = self.gamma_rgb01(cur_rgb01, 0.8)
-        cur_rgb01_proc = self._blur_rgb01(cur_rgb01_proc, ksize=3)
+        # cur_rgb01_proc = self.gamma_rgb01(cur_rgb01, 0.8)
+        cur_rgb01_proc = self._blur_rgb01(cur_rgb01, ksize=3)
         t1 = time.perf_counter()
         timings_ms["preprocess_cd_inputs"] = self._ms(t0, t1)
 
