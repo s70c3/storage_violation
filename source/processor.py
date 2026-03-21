@@ -63,6 +63,7 @@ class StorageViolationFrameProcessor:
         recent_update_every: int = 10,
         max_long_side: int = 640,
         logger: logging.Logger | None = None,
+        visualization: bool = False,
     ):
         self.cd_segmentator = cd_segmentator
         self.delta = int(delta)
@@ -101,6 +102,8 @@ class StorageViolationFrameProcessor:
 
         self._cd_mean = np.asarray([0.485, 0.456, 0.406], np.float32)
         self._cd_std = np.asarray([0.229, 0.224, 0.225], np.float32)
+
+        self.visualization = visualization
 
     def update_runtime_params(
         self,
@@ -687,18 +690,19 @@ class StorageViolationFrameProcessor:
         timings_ms["tracker"] = self._ms(t0, t1)
 
         t0 = time.perf_counter()
-        save_rt_panel(
-            camera_id=camera_id,
-            iter_idx=self._rt_iter_by_camera.get(camera_id, 0) + 1,
-            empty_rgb01=empty_rgb01,
-            recent_rgb01=recent_rgb01_for_cd,
-            cur_rgb01=cur_rgb01,
-            cd_mask01=cd_mask01,
-            candidate_boxes=candidate_boxes_resized,
-            reported_boxes=reported_boxes_resized,
-            logger=self._logger,
-        )
-        self._rt_iter_by_camera[camera_id] = self._rt_iter_by_camera.get(camera_id, 0) + 1
+        if self.visualization:
+            save_rt_panel(
+                camera_id=camera_id,
+                iter_idx=self._rt_iter_by_camera.get(camera_id, 0) + 1,
+                empty_rgb01=empty_rgb01,
+                recent_rgb01=recent_rgb01_for_cd,
+                cur_rgb01=cur_rgb01,
+                cd_mask01=cd_mask01,
+                candidate_boxes=candidate_boxes_resized,
+                reported_boxes=reported_boxes_resized,
+                logger=self._logger,
+            )
+            self._rt_iter_by_camera[camera_id] = self._rt_iter_by_camera.get(camera_id, 0) + 1
         t1 = time.perf_counter()
         timings_ms["visualization"] = self._ms(t0, t1)
 
