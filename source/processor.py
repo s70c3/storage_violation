@@ -600,6 +600,8 @@ class StorageViolationFrameProcessor:
                 "candidate_boxes": np.empty((0, 4), dtype=np.int32),
                 "pending_candidate_boxes": np.empty((0, 4), dtype=np.int32),
                 "reported_boxes": np.empty((0, 4), dtype=np.int32),
+                "candidate_track_ids": [],
+                "reported_track_ids": [],
                 "instance_masks": [],
                 "cd_mask01": None,
                 "fused_mask01": None,
@@ -672,7 +674,12 @@ class StorageViolationFrameProcessor:
 
         t0 = time.perf_counter()
         tracker = self.tracker_by_camera[camera_id]
-        candidate_boxes_resized, reported_boxes_resized = tracker.update(
+        (
+            candidate_boxes_resized,
+            reported_boxes_resized,
+            candidate_track_ids,
+            reported_track_ids,
+        ) = tracker.update(
             now=now_mono,
             current_bboxes=current_bboxes,
             current_masks=inst_masks,
@@ -736,6 +743,8 @@ class StorageViolationFrameProcessor:
             "status": (len(candidate_boxes) > 0 or len(reported_boxes) > 0),
             "candidate_boxes": candidate_boxes,
             "reported_boxes": reported_boxes,
+            "candidate_track_ids": list(candidate_track_ids),
+            "reported_track_ids": list(reported_track_ids),
             "instance_masks": inst_masks,
             "cd_mask01": cd_mask01,
             "fused_mask01": fused01,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import supervision as sv
@@ -142,7 +142,7 @@ class ByteTrackStationaryTracker:
         now: float,
         current_bboxes: List[np.ndarray],
         current_masks: List[np.ndarray] | None = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, List[int], List[int]]:
         if current_masks is None:
             current_masks = [None] * len(current_bboxes)
 
@@ -160,6 +160,8 @@ class ByteTrackStationaryTracker:
             return (
                 np.empty((0, 4), dtype=np.int32),
                 np.empty((0, 4), dtype=np.int32),
+                [],
+                [],
             )
 
         current_boxes = np.asarray(current_bboxes, dtype=np.int32).reshape(-1, 4)
@@ -174,6 +176,7 @@ class ByteTrackStationaryTracker:
         tracked = self.tracker.update_with_detections(detections)
 
         reported_boxes: List[np.ndarray] = []
+        reported_ids: List[int] = []
 
         tracker_ids = tracked.tracker_id
         if tracker_ids is not None:
@@ -213,6 +216,7 @@ class ByteTrackStationaryTracker:
 
                 if st.is_stationary:
                     reported_boxes.append(np.asarray(bbox, dtype=np.int32))
+                    reported_ids.append(tid)
 
         self._cleanup_stale_states(now)
 
@@ -228,4 +232,44 @@ class ByteTrackStationaryTracker:
             iou_thr=0.3,
         )
 
-        return candidate_arr, reported_arr
+        candidate_ids = self._candidate_track_ids(
+            candidate_arr=candidate_arr,
+            current_boxes=current_boxes,
+            tracker_ids=tracker_ids,
+        )
+
+        return candidate_arr, reported_arr, candidate_ids, reported_ids
+
+    def _candidate_track_ids(
+        self,
+        candidate_arr: np.ndarray,
+        current_boxes: np.ndarray,
+        tracker_ids: np.ndarray | None,
+    ) -> List[int]:
+        """Сопоставляет строки candidate_arr с детекциями ByteTrack и возвращает tracker_id."""
+        if len(candidate_arr) == 0:
+            return []
+        out: List[int] = []
+        for row in candidate_arr:
+            best_j = -1
+            best_iou = 0.0
+            r = np.asarray(row, dtype=np.float32).reshape(4)
+            for j in range(len(current_boxes)):
+                iou = self._bbox_iou_xyxy(
+                    np.asarray(current_boxes[j], dtype=np.float32),
+                    r,
+                )
+                if iou > best_iou:
+                    best_iou = iou
+                    best_j = j
+            if (
+                best_j >= 0
+                and best_iou >= 0.25
+                and tracker_ids is not None
+                and best_j < len(tracker_ids)
+            ):
+                raw = tracker_ids[best_j]
+                out.append(int(raw) if raw is not None else -1)
+            else:
+                out.append(-1)
+        return out
