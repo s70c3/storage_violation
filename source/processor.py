@@ -20,7 +20,6 @@ class CameraEMAState:
     empty_rgb01: np.ndarray
     recent_rgb01: np.ndarray
     last_ts_mono: float
-    last_detect_mono: float
     detect_started: bool = False
     recent_frame_i: int = 0
     recent_dt_accum: float = 0.0
@@ -44,11 +43,9 @@ class StorageViolationFrameProcessor:
     def __init__(
         self,
         cd_segmentator: SemanticSegmentatorProtocol,
-        delta: int = 2,
         ema_tau_sec: float = 5.0,
         ema_min_alpha: float = 0.02,
         ema_max_alpha: float = 0.12,
-        min_empty_weight: float = 0.20,
         thr: float = 0.5,
         min_side: int = 100,
         morph_ksize: int = 3,
@@ -66,7 +63,6 @@ class StorageViolationFrameProcessor:
         visualization: bool = False,
     ):
         self.cd_segmentator = cd_segmentator
-        self.delta = int(delta)
 
         self.camera_state: Dict[str, CameraEMAState] = {}
         self.tracker_by_camera: Dict[str, ByteTrackStationaryTracker] = {}
@@ -74,8 +70,6 @@ class StorageViolationFrameProcessor:
         self.ema_tau_sec = float(ema_tau_sec)
         self.ema_min_alpha = float(ema_min_alpha)
         self.ema_max_alpha = float(ema_max_alpha)
-
-        self.min_empty_weight = float(min_empty_weight)
 
         self.thr = float(thr)
         self.min_side = int(min_side)
@@ -173,12 +167,6 @@ class StorageViolationFrameProcessor:
         if camera_id not in self.tracker_by_camera:
             self.tracker_by_camera[camera_id] = self._make_tracker()
             self._logger.info(f"[INIT] tracker created for camera={camera_id}")
-
-    def _should_detect(self, st: CameraEMAState, now_mono: float) -> bool:
-        if (now_mono - st.last_detect_mono) >= float(self.delta):
-            st.last_detect_mono = now_mono
-            return True
-        return False
 
     def _ema_alpha(self, dt: float) -> float:
         if self.ema_tau_sec <= 1e-6:
@@ -457,7 +445,6 @@ class StorageViolationFrameProcessor:
             empty_rgb01=empty_rgb01,
             recent_rgb01=empty_rgb01.copy(),
             last_ts_mono=now_mono,
-            last_detect_mono=now_mono - float(self.delta),
             detect_started=False,
             recent_frame_i=0,
             recent_dt_accum=0.0,
@@ -475,18 +462,6 @@ class StorageViolationFrameProcessor:
     ) -> None:
         self._init_camera_state_if_needed(camera_id, frame_hw, ideal_bgr, now_mono)
         self._ensure_camera_tracker(camera_id)
-
-    def gamma_rgb01(self, x: np.ndarray, gamma: float = 0.8) -> np.ndarray:
-        x = np.clip(x, 0.0, 1.0)
-        return np.power(x, gamma).astype(np.float32)
-
-    @staticmethod
-    def _blur_rgb01(rgb01: np.ndarray, ksize: int = 5) -> np.ndarray:
-        if rgb01 is None or ksize <= 1:
-            return rgb01
-        if (ksize % 2) == 0:
-            ksize += 1
-        return cv2.GaussianBlur(rgb01, (ksize, ksize), 0)
 
     @staticmethod
     def _ms(t0: float, t1: float) -> float:
@@ -573,74 +548,9 @@ class StorageViolationFrameProcessor:
         t1 = time.perf_counter()
         timings_ms["update_recent"] = self._ms(t0, t1)
 
-        t0 = time.perf_counter()
-        should_detect = self._should_detect(st, now_mono)
-        t1 = time.perf_counter()
-        timings_ms["delta_gate"] = self._ms(t0, t1)
-
-        if not should_detect:
-            t_total_1 = time.perf_counter()
-            timings_ms["total"] = self._ms(t_total_0, t_total_1)
-
-            self._logger.info(
-                f"[TIMING] camera={camera_id} "
-                f"total={timings_ms['total']:.3f}ms "
-                f"resize_prepare={timings_ms['resize_prepare']:.3f} "
-                f"init={timings_ms['init']:.3f} "
-                f"zone_mask={timings_ms['zone_mask']:.3f} "
-                f"update_recent={timings_ms['update_recent']:.3f} "
-                f"delta_gate={timings_ms['delta_gate']:.3f} "
-                f"skipped_by_delta=1"
-            )
-
-            return {
-                "detected": False,
-                "status": False,
-                "boxes": np.empty((0, 4), dtype=np.int32),
-                "candidate_boxes": np.empty((0, 4), dtype=np.int32),
-                "pending_candidate_boxes": np.empty((0, 4), dtype=np.int32),
-                "reported_boxes": np.empty((0, 4), dtype=np.int32),
-                "candidate_track_ids": [],
-                "reported_track_ids": [],
-                "instance_masks": [],
-                "cd_mask01": None,
-                "fused_mask01": None,
-                "debug": {
-                    "camera_id": camera_id,
-                    "alpha_used": alpha_used,
-                    "detect_started": st.detect_started,
-                    "n_instances": 0,
-                    "candidate_len": 0,
-                    "reported_len": 0,
-                    "skipped_by_delta": True,
-                    "resize_scale": resize_scale,
-                    "processed_hw": [h, w],
-                    "original_hw": [orig_h, orig_w],
-                    "timings_ms": timings_ms,
-                },
-            }
-
-        t0 = time.perf_counter()
-        recent_rgb01_for_cd = (
-            (1.0 - self.min_empty_weight) * st.recent_rgb01
-            + self.min_empty_weight * st.empty_rgb01
-        )
-
-        # empty_rgb01 = self.gamma_rgb01(st.empty_rgb01, 0.8)
-        empty_rgb01 = self._blur_rgb01(st.empty_rgb01, ksize=3)
-
-        # recent_rgb01_for_cd = self.gamma_rgb01(recent_rgb01_for_cd, 0.8)
-        blur_size = max(3, (recent_rgb01_for_cd.shape[1] // 40) | 1)
-        recent_blur = self._blur_rgb01(recent_rgb01_for_cd, ksize=blur_size)
-        recent_rgb01_for_cd = (
-            (1.0 - self.min_empty_weight) * recent_blur
-            + self.min_empty_weight * st.empty_rgb01
-        )
-
-        # cur_rgb01_proc = self.gamma_rgb01(cur_rgb01, 0.8)
-        cur_rgb01_proc = self._blur_rgb01(cur_rgb01, ksize=3)
-        t1 = time.perf_counter()
-        timings_ms["preprocess_cd_inputs"] = self._ms(t0, t1)
+        empty_rgb01 = st.empty_rgb01
+        recent_rgb01_for_cd = st.recent_rgb01
+        cur_rgb01_proc = cur_rgb01
 
         t0 = time.perf_counter()
         cd_mask01 = self._infer_cd_mask01(
@@ -729,8 +639,6 @@ class StorageViolationFrameProcessor:
             f"init={timings_ms['init']:.3f} "
             f"zone_mask={timings_ms['zone_mask']:.3f} "
             f"update_recent={timings_ms['update_recent']:.3f} "
-            f"delta_gate={timings_ms['delta_gate']:.3f} "
-            f"preprocess_cd_inputs={timings_ms['preprocess_cd_inputs']:.3f} "
             f"infer_cd={timings_ms['infer_cd']:.3f} "
             f"fuse={timings_ms['fuse']:.3f} "
             f"postprocess_instances={timings_ms['postprocess_instances']:.3f} "
@@ -756,7 +664,6 @@ class StorageViolationFrameProcessor:
                 "current_frame_boxes_len": len(current_bboxes),
                 "candidate_len": len(candidate_boxes),
                 "reported_len": len(reported_boxes),
-                "skipped_by_delta": False,
                 "resize_scale": resize_scale,
                 "processed_hw": [h, w],
                 "original_hw": [orig_h, orig_w],

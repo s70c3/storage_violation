@@ -31,7 +31,6 @@ MODEL_INP_CH = 9
 
 PROCESSOR_KWARGS = dict(
     min_side=10,
-    delta=0,
     stationary_time_sec=5.0,
     max_long_side=640
 )

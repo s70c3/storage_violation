@@ -41,6 +41,30 @@ http://localhost:8000/docs
 
 ``` python3 process_video.py --ideal-image data/ofis_big.png --video data/ofis_big.mp4```
 
+## Локальный запуск (без API)
+
+Скрипт `run_local.py` запускает тот же пайплайн напрямую (без FastAPI).
+
+- Прогон одного изображения:
+
+```bash
+python3 run_local.py \
+  --ideal-image data/ideal.png \
+  --frame data/frame.jpg \
+  --out-image out.jpg \
+  --out-json out.json
+```
+
+- Прогон видео:
+
+```bash
+python3 run_local.py \
+  --ideal-image data/ideal.png \
+  --video data/video1.avi \
+  --out-video out.mp4 \
+  --out-jsonl out.jsonl
+```
+
 ## Демо через API (без клиента)
 
 В `./data` (в контейнере монтируется в `/app/data`; путь задан константой `DATA_DIR` в `source/demo_pipeline.py`) должны лежать файлы для выбранного пресета:
