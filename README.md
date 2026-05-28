@@ -65,6 +65,24 @@ python3 run_local.py \
   --out-jsonl out.jsonl
 ```
 
+### Фон (идеальное изображение) без загрузки ideal
+
+Можно не передавать `--ideal-image`, а брать фон автоматически:
+
+- **`--ideal-mode first_frame`**: фон = первый кадр (быстро, но хрупко к шуму/людям в кадре).
+- **`--ideal-mode median`**: фон = медиана по последним N кадрам (стабильнее, но тяжелее по CPU/RAM).
+
+Пример:
+
+```bash
+python3 run_local.py \
+  --ideal-mode median \
+  --bg-median-window 25 \
+  --bg-median-update-every 5 \
+  --video data/video1.avi \
+  --out-video out.mp4
+```
+
 ## Демо через API (без клиента)
 
 В `./data` (в контейнере монтируется в `/app/data`; путь задан константой `DATA_DIR` в `source/demo_pipeline.py`) должны лежать файлы для выбранного пресета:

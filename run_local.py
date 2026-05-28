@@ -88,6 +88,9 @@ def _build_processor(
     stationary_time_sec: float,
     max_long_side: int,
     visualization: bool,
+    ideal_mode: str,
+    bg_median_window: int,
+    bg_median_update_every: int,
 ) -> "StorageViolationFrameProcessor":
     # Lazy imports so `--help` works without full runtime deps installed.
     from source.processor import StorageViolationFrameProcessor
@@ -106,6 +109,9 @@ def _build_processor(
         stationary_time_sec=stationary_time_sec,
         max_long_side=max_long_side,
         visualization=visualization,
+        ideal_mode=ideal_mode,
+        bg_median_window=bg_median_window,
+        bg_median_update_every=bg_median_update_every,
     )
     processor.load()
     return processor
@@ -114,7 +120,7 @@ def _build_processor(
 def run_on_image(
     processor: "StorageViolationFrameProcessor",
     camera_id: str,
-    ideal_bgr: np.ndarray,
+    ideal_bgr: Optional[np.ndarray],
     frame_path: str,
     polygons: Optional[list[np.ndarray]],
     out_json: Optional[str],
@@ -142,7 +148,7 @@ def run_on_image(
 def run_on_video(
     processor: "StorageViolationFrameProcessor",
     camera_id: str,
-    ideal_bgr: np.ndarray,
+    ideal_bgr: Optional[np.ndarray],
     video_path: str,
     polygons: Optional[list[np.ndarray]],
     out_video: str,
@@ -212,13 +218,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inp-ch", type=int, default=9)
 
     p.add_argument("--camera-id", type=str, default="cam_1")
-    p.add_argument("--ideal-image", type=str, required=True)
+    p.add_argument("--ideal-image", type=str, default=None)
     p.add_argument("--polygons", type=str, default=None, help='Polygons JSON, e.g. \'[[[100,100],[900,100],[900,700],[100,700]]]\'')
 
     p.add_argument("--min-side", type=int, default=10)
     p.add_argument("--stationary-time-sec", type=float, default=5.0)
     p.add_argument("--max-long-side", type=int, default=640)
     p.add_argument("--visualization", action="store_true")
+    p.add_argument("--ideal-mode", type=str, default="static", choices=["static", "first_frame", "median"])
+    p.add_argument("--bg-median-window", type=int, default=25)
+    p.add_argument("--bg-median-update-every", type=int, default=5)
 
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--frame", type=str, default=None, help="Path to single frame image")
@@ -236,7 +245,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    ideal_bgr = _read_bgr(args.ideal_image)
+    ideal_bgr = _read_bgr(args.ideal_image) if args.ideal_image else None
     polygons = _parse_polygons(args.polygons)
 
     try:
@@ -250,6 +259,9 @@ def main() -> None:
             stationary_time_sec=float(args.stationary_time_sec),
             max_long_side=int(args.max_long_side),
             visualization=bool(args.visualization),
+            ideal_mode=str(args.ideal_mode),
+            bg_median_window=int(args.bg_median_window),
+            bg_median_update_every=int(args.bg_median_update_every),
         )
     except ModuleNotFoundError as e:
         missing = getattr(e, "name", None) or str(e)

@@ -4,7 +4,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
 import cv2
 import numpy as np
@@ -23,6 +23,9 @@ class CameraEMAState:
     detect_started: bool = False
     recent_frame_i: int = 0
     recent_dt_accum: float = 0.0
+    bg_frame_i: int = 0
+    bg_u8_ring: Optional[List[np.ndarray]] = None
+    bg_u8_ring_pos: int = 0
 
 
 class StorageViolationFrameProcessor:
@@ -43,6 +46,9 @@ class StorageViolationFrameProcessor:
     def __init__(
         self,
         cd_segmentator: SemanticSegmentatorProtocol,
+        ideal_mode: Literal["static", "first_frame", "median"] = "static",
+        bg_median_window: int = 25,
+        bg_median_update_every: int = 5,
         ema_tau_sec: float = 5.0,
         ema_min_alpha: float = 0.02,
         ema_max_alpha: float = 0.12,
@@ -63,6 +69,12 @@ class StorageViolationFrameProcessor:
         visualization: bool = False,
     ):
         self.cd_segmentator = cd_segmentator
+        self.ideal_mode = str(ideal_mode)
+        if self.ideal_mode not in ("static", "first_frame", "median"):
+            raise ValueError(f"ideal_mode must be one of: static, first_frame, median; got {ideal_mode}")
+
+        self.bg_median_window = max(1, int(bg_median_window))
+        self.bg_median_update_every = max(1, int(bg_median_update_every))
 
         self.camera_state: Dict[str, CameraEMAState] = {}
         self.tracker_by_camera: Dict[str, ByteTrackStationaryTracker] = {}
@@ -425,21 +437,66 @@ class StorageViolationFrameProcessor:
         self._prepared_empty_cache[cache_key] = empty_rgb01
         return empty_rgb01
 
+    @staticmethod
+    def _rgb01_to_u8(rgb01: np.ndarray) -> np.ndarray:
+        x = np.clip(rgb01 * 255.0, 0.0, 255.0).astype(np.uint8)
+        return np.ascontiguousarray(x)
+
+    def _bg_update_from_frame(self, st: CameraEMAState, cur_rgb01: np.ndarray) -> None:
+        """
+        Updates st.empty_rgb01 (background reference) for modes:
+        - first_frame: set once on first seen frame
+        - median: rolling per-pixel median over last N frames
+        """
+        if self.ideal_mode == "static":
+            return
+
+        st.bg_frame_i += 1
+        cur_u8 = self._rgb01_to_u8(cur_rgb01)
+
+        if self.ideal_mode == "first_frame":
+            if st.bg_u8_ring is None:
+                st.bg_u8_ring = [cur_u8]
+                st.empty_rgb01 = cur_u8.astype(np.float32) / 255.0
+            return
+
+        # median mode
+        if st.bg_u8_ring is None:
+            st.bg_u8_ring = [cur_u8.copy() for _ in range(self.bg_median_window)]
+            st.bg_u8_ring_pos = 0
+        else:
+            st.bg_u8_ring[st.bg_u8_ring_pos] = cur_u8
+            st.bg_u8_ring_pos = (st.bg_u8_ring_pos + 1) % len(st.bg_u8_ring)
+
+        if (st.bg_frame_i % self.bg_median_update_every) != 0:
+            return
+
+        # stack: (N,H,W,3) then median along N
+        stack = np.stack(st.bg_u8_ring, axis=0)
+        med = np.median(stack, axis=0).astype(np.uint8)
+        st.empty_rgb01 = med.astype(np.float32) / 255.0
+
     def _init_camera_state_if_needed(
         self,
         camera_id: str,
         frame_hw: Tuple[int, int],
-        ideal_bgr: np.ndarray,
+        ideal_bgr: Optional[np.ndarray],
         now_mono: float,
     ) -> None:
         if camera_id in self.camera_state:
             return
 
-        empty_rgb01 = self._prepare_empty_rgb01(
-            camera_id=camera_id,
-            ideal_bgr=ideal_bgr,
-            target_hw=frame_hw,
-        )
+        if self.ideal_mode == "static":
+            if ideal_bgr is None:
+                raise ValueError("ideal_bgr is None (ideal_mode=static)")
+            empty_rgb01 = self._prepare_empty_rgb01(
+                camera_id=camera_id,
+                ideal_bgr=ideal_bgr,
+                target_hw=frame_hw,
+            )
+        else:
+            # Placeholder; will be overwritten from the first frame in _bg_update_from_frame
+            empty_rgb01 = np.zeros((frame_hw[0], frame_hw[1], 3), dtype=np.float32)
 
         self.camera_state[camera_id] = CameraEMAState(
             empty_rgb01=empty_rgb01,
@@ -457,7 +514,7 @@ class StorageViolationFrameProcessor:
         self,
         camera_id: str,
         frame_hw: Tuple[int, int],
-        ideal_bgr: np.ndarray,
+        ideal_bgr: Optional[np.ndarray],
         now_mono: float,
     ) -> None:
         self._init_camera_state_if_needed(camera_id, frame_hw, ideal_bgr, now_mono)
@@ -471,7 +528,7 @@ class StorageViolationFrameProcessor:
         self,
         camera_id: str,
         frame_bgr: np.ndarray,
-        ideal_bgr: np.ndarray,
+        ideal_bgr: Optional[np.ndarray],
         polygons: Optional[List[np.ndarray]] = None,
         now_mono: Optional[float] = None,
         frame_obj: Any = None,
@@ -480,8 +537,8 @@ class StorageViolationFrameProcessor:
 
         if frame_bgr is None:
             raise ValueError("frame_bgr is None")
-        if ideal_bgr is None:
-            raise ValueError("ideal_bgr is None")
+        if self.ideal_mode == "static" and ideal_bgr is None:
+            raise ValueError("ideal_bgr is None (ideal_mode=static)")
 
         orig_h, orig_w = frame_bgr.shape[:2]
 
@@ -499,8 +556,10 @@ class StorageViolationFrameProcessor:
         h, w = cur_bgr.shape[:2]
 
         if resize_scale != 1.0:
-            ideal_bgr_resized = cv2.resize(ideal_bgr, (w, h), interpolation=cv2.INTER_AREA)
-            ideal_bgr_resized = np.ascontiguousarray(ideal_bgr_resized)
+            ideal_bgr_resized: Optional[np.ndarray] = None
+            if ideal_bgr is not None:
+                ideal_bgr_resized = cv2.resize(ideal_bgr, (w, h), interpolation=cv2.INTER_AREA)
+                ideal_bgr_resized = np.ascontiguousarray(ideal_bgr_resized)
 
             polygons_resized = None
             if polygons is not None:
@@ -519,7 +578,7 @@ class StorageViolationFrameProcessor:
                     ]
                     raw_humans.boxes = scaled_boxes
         else:
-            ideal_bgr_resized = np.ascontiguousarray(ideal_bgr)
+            ideal_bgr_resized = np.ascontiguousarray(ideal_bgr) if ideal_bgr is not None else None
             polygons_resized = polygons
 
         cur_rgb01 = self._bgr_u8_to_rgb01(cur_bgr)
@@ -547,6 +606,11 @@ class StorageViolationFrameProcessor:
         alpha_used = self._update_recent(st=st, cur_rgb01=cur_rgb01, now_mono=now_mono)
         t1 = time.perf_counter()
         timings_ms["update_recent"] = self._ms(t0, t1)
+
+        t0 = time.perf_counter()
+        self._bg_update_from_frame(st=st, cur_rgb01=cur_rgb01)
+        t1 = time.perf_counter()
+        timings_ms["bg_update"] = self._ms(t0, t1)
 
         empty_rgb01 = st.empty_rgb01
         recent_rgb01_for_cd = st.recent_rgb01
@@ -639,6 +703,7 @@ class StorageViolationFrameProcessor:
             f"init={timings_ms['init']:.3f} "
             f"zone_mask={timings_ms['zone_mask']:.3f} "
             f"update_recent={timings_ms['update_recent']:.3f} "
+            f"bg_update={timings_ms['bg_update']:.3f} "
             f"infer_cd={timings_ms['infer_cd']:.3f} "
             f"fuse={timings_ms['fuse']:.3f} "
             f"postprocess_instances={timings_ms['postprocess_instances']:.3f} "

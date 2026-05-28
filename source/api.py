@@ -32,7 +32,8 @@ MODEL_INP_CH = 9
 PROCESSOR_KWARGS = dict(
     min_side=10,
     stationary_time_sec=5.0,
-    max_long_side=640
+    max_long_side=640,
+    ideal_mode="static",
 )
 
 def decode_image_bytes(image_bytes: bytes) -> np.ndarray:
