@@ -149,15 +149,32 @@ def run_on_video(
     processor: "StorageViolationFrameProcessor",
     camera_id: str,
     ideal_bgr: Optional[np.ndarray],
-    video_path: str,
+    video_path: Optional[str],
+    rtsp_url: Optional[str],
     polygons: Optional[list[np.ndarray]],
     out_video: str,
     out_jsonl: Optional[str],
     every_n_frames: int,
+    show: bool,
+    window_name: str,
+    wait_ms: int,
+    reconnect_sec: float,
 ) -> None:
-    cap = cv2.VideoCapture(video_path)
+    src = rtsp_url if rtsp_url else video_path
+    if not src:
+        raise ValueError("video source is empty")
+
+    def open_cap() -> cv2.VideoCapture:
+        # Prefer FFmpeg backend if available; it is more robust for RTSP.
+        cap0 = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+        if cap0.isOpened():
+            return cap0
+        cap0.release()
+        return cv2.VideoCapture(src)
+
+    cap = open_cap()
     if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video: {video_path}")
+        raise RuntimeError(f"Failed to open video source: {src}")
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0:
@@ -185,6 +202,13 @@ def run_on_video(
         while True:
             ok, frame_bgr = cap.read()
             if not ok:
+                if rtsp_url:
+                    cap.release()
+                    time.sleep(max(0.0, float(reconnect_sec)))
+                    cap = open_cap()
+                    if not cap.isOpened():
+                        continue
+                    continue
                 break
 
             frame_idx += 1
@@ -201,9 +225,20 @@ def run_on_video(
 
             vis = _draw_result(frame_bgr, last_result)
             writer.write(vis)
+
+            if show:
+                cv2.imshow(window_name, vis)
+                key = cv2.waitKey(int(wait_ms)) & 0xFF
+                if key in (ord("q"), 27):  # q or ESC
+                    break
     finally:
         cap.release()
         writer.release()
+        if show:
+            try:
+                cv2.destroyWindow(window_name)
+            except Exception:
+                cv2.destroyAllWindows()
         if jsonl_f is not None:
             jsonl_f.close()
 
@@ -212,7 +247,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Local runner for storage_violation pipeline (no API)")
 
     p.add_argument("--weights", type=str, default="weights/cd_weights.pt")
-    p.add_argument("--device", type=str, default="cuda:0")
+    p.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Inference device: auto, cpu, cuda:0, mps (auto picks cuda/mps/cpu)",
+    )
     p.add_argument("--half", action="store_true", help="Use FP16 (only makes sense on CUDA)")
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--inp-ch", type=int, default=9)
@@ -232,6 +272,7 @@ def parse_args() -> argparse.Namespace:
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--frame", type=str, default=None, help="Path to single frame image")
     src.add_argument("--video", type=str, default=None, help="Path to input video")
+    src.add_argument("--rtsp", type=str, default=None, help="RTSP URL, e.g. rtsp://user:pass@host:554/stream")
 
     p.add_argument("--out-json", type=str, default=None, help="Output JSON path (image mode)")
     p.add_argument("--out-image", type=str, default=None, help="Output image path (image mode)")
@@ -239,6 +280,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-video", type=str, default="output.mp4", help="Output video path (video mode)")
     p.add_argument("--out-jsonl", type=str, default=None, help="Output JSONL path (video mode)")
     p.add_argument("--every-n-frames", type=int, default=1, help="Run inference every Nth frame (video mode)")
+    p.add_argument("--show", action="store_true", help="Show results in OpenCV window (video/rtsp)")
+    p.add_argument("--window-name", type=str, default="storage_violation", help="OpenCV window name")
+    p.add_argument("--wait-ms", type=int, default=1, help="cv2.waitKey delay (ms), affects UI responsiveness")
+    p.add_argument("--rtsp-reconnect-sec", type=float, default=1.0, help="Reconnect delay when RTSP read fails")
     return p.parse_args()
 
 
@@ -287,10 +332,15 @@ def main() -> None:
                 camera_id=args.camera_id,
                 ideal_bgr=ideal_bgr,
                 video_path=args.video,
+                rtsp_url=args.rtsp,
                 polygons=polygons,
                 out_video=args.out_video,
                 out_jsonl=args.out_jsonl,
                 every_n_frames=max(1, int(args.every_n_frames)),
+                show=bool(args.show),
+                window_name=str(args.window_name),
+                wait_ms=int(args.wait_ms),
+                reconnect_sec=float(args.rtsp_reconnect_sec),
             )
             print(f"[OK] Saved video: {args.out_video}")
             if args.out_jsonl:

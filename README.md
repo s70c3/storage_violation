@@ -65,6 +65,18 @@ python3 run_local.py \
   --out-jsonl out.jsonl
 ```
 
+### RTSP + показ в окне OpenCV
+
+```bash
+python3 run_local.py \
+  --rtsp "rtsp://user:pass@host:554/stream" \
+  --ideal-mode median \
+  --show \
+  --out-video out.mp4
+```
+
+- **Выход**: нажмите `q` или `Esc` в окне.
+
 ### Фон (идеальное изображение) без загрузки ideal
 
 Можно не передавать `--ideal-image`, а брать фон автоматически:

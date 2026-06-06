@@ -193,10 +193,44 @@ class UNetVGG16Segmentator:
         self.inp_ch = int(inp_ch)
         self._logger = logger or logging.getLogger("UNetVGG16Segmentator")
 
+    @staticmethod
+    def resolve_device(device: str) -> str:
+        device = str(device).strip().lower()
+        if device in ("auto", ""):
+            if torch.cuda.is_available():
+                return "cuda:0"
+            mps_backend = getattr(torch.backends, "mps", None)
+            if mps_backend is not None and mps_backend.is_available():
+                return "mps"
+            return "cpu"
+
+        if device.startswith("cuda"):
+            if torch.cuda.is_available():
+                return device if ":" in device else "cuda:0"
+            return "cpu"
+
+        if device.startswith("mps"):
+            mps_backend = getattr(torch.backends, "mps", None)
+            if mps_backend is not None and mps_backend.is_available():
+                return "mps"
+            return "cpu"
+
+        return device
+
     def build_model(self) -> nn.Module:
         return unet_vgg16(inp_ch=self.inp_ch, skip=self.skip)
 
     def load(self) -> None:
+        requested = self._device
+        self._device = self.resolve_device(requested)
+        if self._device != requested:
+            self._logger.warning(
+                f"[CD-MODEL] device={requested!r} unavailable, using {self._device!r}"
+            )
+        if self.half and "cuda" not in self._device:
+            self._logger.warning("[CD-MODEL] half precision requires CUDA, disabled")
+            self.half = False
+
         model = self.build_model()
 
         ckpt = torch.load(self._weights_path, map_location="cpu", weights_only=True)
@@ -223,7 +257,7 @@ class UNetVGG16Segmentator:
         self._model = model
         self._logger.info(
             f"[CD-MODEL] loaded weights={self._weights_path} "
-            f"inp_ch={self.inp_ch} half={self.half} "
+            f"device={self._device} inp_ch={self.inp_ch} half={self.half} "
             f"missing={len(missing)} unexpected={len(unexpected)}"
         )
 
