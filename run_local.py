@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
-import time
 from pathlib import Path
-from typing import Optional
 
 import cv2
 import numpy as np
+
+from source.ideal_storage import IdealImageStorage
+from source.runner_common import (
+    build_processor,
+    draw_result,
+    parse_polygons_json,
+    prepare_ideal_bgr,
+    run_on_image,
+    run_video_pipeline,
+)
 
 
 def _read_bgr(path: str) -> np.ndarray:
@@ -15,232 +23,6 @@ def _read_bgr(path: str) -> np.ndarray:
     if img is None:
         raise FileNotFoundError(f"Failed to read image: {path}")
     return np.ascontiguousarray(img)
-
-
-def _draw_result(frame_bgr: np.ndarray, result: dict) -> np.ndarray:
-    vis = frame_bgr.copy()
-
-    status = bool(result.get("status", False))
-    detected = bool(result.get("detected", False))
-    debug = result.get("debug", {})
-
-    candidate_boxes = result.get("candidate_boxes", []) or []
-    reported_boxes = result.get("reported_boxes", []) or []
-
-    for box in candidate_boxes:
-        x1, y1, x2, y2 = map(int, box)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(
-            vis,
-            "candidate",
-            (x1, max(20, y1 - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA,
-        )
-
-    for box in reported_boxes:
-        x1, y1, x2, y2 = map(int, box)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 255), 3)
-        cv2.putText(
-            vis,
-            "reported",
-            (x1, max(20, y1 - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-    text1 = f"detected={detected} status={status} cand={len(candidate_boxes)} reported={len(reported_boxes)}"
-    text2 = (
-        f"n_inst={debug.get('n_instances', 0)} "
-        f"cand_dbg={debug.get('candidate_len', 0)} "
-        f"rep_dbg={debug.get('reported_len', 0)} "
-        f"alpha={debug.get('alpha_used', 0):.4f}"
-    )
-    cv2.putText(vis, text1, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(vis, text2, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2, cv2.LINE_AA)
-    return vis
-
-
-def _parse_polygons(polygons: Optional[str]) -> Optional[list[np.ndarray]]:
-    if polygons is None or polygons.strip() == "":
-        return None
-    raw = json.loads(polygons)
-    out: list[np.ndarray] = []
-    for poly in raw:
-        out.append(np.asarray(poly, dtype=np.float32))
-    return out
-
-
-def _build_processor(
-    weights_path: str,
-    device: str,
-    half: bool,
-    threshold: float,
-    inp_ch: int,
-    *,
-    min_side: int,
-    stationary_time_sec: float,
-    max_long_side: int,
-    visualization: bool,
-    ideal_mode: str,
-    bg_median_window: int,
-    bg_median_update_every: int,
-) -> "StorageViolationFrameProcessor":
-    # Lazy imports so `--help` works without full runtime deps installed.
-    from source.processor import StorageViolationFrameProcessor
-    from source.segmentator import UNetVGG16Segmentator
-
-    segmentator = UNetVGG16Segmentator(
-        weights_path=weights_path,
-        device=device,
-        half=half,
-        threshold=threshold,
-        inp_ch=inp_ch,
-    )
-    processor = StorageViolationFrameProcessor(
-        cd_segmentator=segmentator,
-        min_side=min_side,
-        stationary_time_sec=stationary_time_sec,
-        max_long_side=max_long_side,
-        visualization=visualization,
-        ideal_mode=ideal_mode,
-        bg_median_window=bg_median_window,
-        bg_median_update_every=bg_median_update_every,
-    )
-    processor.load()
-    return processor
-
-
-def run_on_image(
-    processor: "StorageViolationFrameProcessor",
-    camera_id: str,
-    ideal_bgr: Optional[np.ndarray],
-    frame_path: str,
-    polygons: Optional[list[np.ndarray]],
-    out_json: Optional[str],
-    out_image: Optional[str],
-) -> dict:
-    frame_bgr = _read_bgr(frame_path)
-    result = processor.process_frame(
-        camera_id=camera_id,
-        frame_bgr=frame_bgr,
-        ideal_bgr=ideal_bgr,
-        polygons=polygons,
-        now_mono=time.monotonic(),
-    )
-
-    if out_json:
-        Path(out_json).write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
-    if out_image:
-        vis = _draw_result(frame_bgr, result)
-        ok = cv2.imwrite(out_image, vis)
-        if not ok:
-            raise RuntimeError(f"Failed to write image: {out_image}")
-    return result
-
-
-def run_on_video(
-    processor: "StorageViolationFrameProcessor",
-    camera_id: str,
-    ideal_bgr: Optional[np.ndarray],
-    video_path: Optional[str],
-    rtsp_url: Optional[str],
-    polygons: Optional[list[np.ndarray]],
-    out_video: str,
-    out_jsonl: Optional[str],
-    every_n_frames: int,
-    show: bool,
-    window_name: str,
-    wait_ms: int,
-    reconnect_sec: float,
-) -> None:
-    src = rtsp_url if rtsp_url else video_path
-    if not src:
-        raise ValueError("video source is empty")
-
-    def open_cap() -> cv2.VideoCapture:
-        # Prefer FFmpeg backend if available; it is more robust for RTSP.
-        cap0 = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
-        if cap0.isOpened():
-            return cap0
-        cap0.release()
-        return cv2.VideoCapture(src)
-
-    cap = open_cap()
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video source: {src}")
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
-        fps = 25
-
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(out_video, fourcc, fps, (width, height))
-    if not writer.isOpened():
-        raise RuntimeError(f"Failed to open video writer: {out_video}")
-
-    jsonl_f = open(out_jsonl, "w", encoding="utf-8") if out_jsonl else None
-    try:
-        frame_idx = 0
-        last_result: dict = {
-            "detected": False,
-            "status": False,
-            "candidate_boxes": [],
-            "reported_boxes": [],
-            "debug": {},
-        }
-
-        while True:
-            ok, frame_bgr = cap.read()
-            if not ok:
-                if rtsp_url:
-                    cap.release()
-                    time.sleep(max(0.0, float(reconnect_sec)))
-                    cap = open_cap()
-                    if not cap.isOpened():
-                        continue
-                    continue
-                break
-
-            frame_idx += 1
-            if every_n_frames <= 1 or (frame_idx % every_n_frames) == 0:
-                last_result = processor.process_frame(
-                    camera_id=camera_id,
-                    frame_bgr=frame_bgr,
-                    ideal_bgr=ideal_bgr,
-                    polygons=polygons,
-                    now_mono=time.monotonic(),
-                )
-                if jsonl_f is not None:
-                    jsonl_f.write(json.dumps({"frame_idx": frame_idx, "result": last_result}, ensure_ascii=False) + "\n")
-
-            vis = _draw_result(frame_bgr, last_result)
-            writer.write(vis)
-
-            if show:
-                cv2.imshow(window_name, vis)
-                key = cv2.waitKey(int(wait_ms)) & 0xFF
-                if key in (ord("q"), 27):  # q or ESC
-                    break
-    finally:
-        cap.release()
-        writer.release()
-        if show:
-            try:
-                cv2.destroyWindow(window_name)
-            except Exception:
-                cv2.destroyAllWindows()
-        if jsonl_f is not None:
-            jsonl_f.close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -251,39 +33,47 @@ def parse_args() -> argparse.Namespace:
         "--device",
         type=str,
         default="auto",
-        help="Inference device: auto, cpu, cuda:0, mps (auto picks cuda/mps/cpu)",
+        help="Inference device: auto, cpu, cuda:0, mps",
     )
-    p.add_argument("--half", action="store_true", help="Use FP16 (only makes sense on CUDA)")
+    p.add_argument("--half", action="store_true")
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--inp-ch", type=int, default=9)
 
     p.add_argument("--camera-id", type=str, default="cam_1")
     p.add_argument("--ideal-image", type=str, default=None)
-    p.add_argument("--polygons", type=str, default=None, help='Polygons JSON, e.g. \'[[[100,100],[900,100],[900,700],[100,700]]]\'')
+    p.add_argument("--polygons", type=str, default=None)
 
     p.add_argument("--min-side", type=int, default=10)
     p.add_argument("--stationary-time-sec", type=float, default=5.0)
     p.add_argument("--max-long-side", type=int, default=640)
     p.add_argument("--visualization", action="store_true")
-    p.add_argument("--ideal-mode", type=str, default="static", choices=["static", "first_frame", "median"])
-    p.add_argument("--bg-median-window", type=int, default=25)
+    p.add_argument(
+        "--ideal-mode",
+        type=str,
+        default="static",
+        choices=["static", "first_frame", "median", "mean"],
+    )
+    p.add_argument("--ideal-frames", type=int, default=25)
+    p.add_argument("--bg-median-window", type=int, default=None)
     p.add_argument("--bg-median-update-every", type=int, default=5)
 
     src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--frame", type=str, default=None, help="Path to single frame image")
-    src.add_argument("--video", type=str, default=None, help="Path to input video")
-    src.add_argument("--rtsp", type=str, default=None, help="RTSP URL, e.g. rtsp://user:pass@host:554/stream")
+    src.add_argument("--frame", type=str, default=None)
+    src.add_argument("--video", type=str, default=None)
+    src.add_argument("--rtsp", type=str, default=None)
 
-    p.add_argument("--out-json", type=str, default=None, help="Output JSON path (image mode)")
-    p.add_argument("--out-image", type=str, default=None, help="Output image path (image mode)")
-
-    p.add_argument("--out-video", type=str, default="output.mp4", help="Output video path (video mode)")
-    p.add_argument("--out-jsonl", type=str, default=None, help="Output JSONL path (video mode)")
-    p.add_argument("--every-n-frames", type=int, default=1, help="Run inference every Nth frame (video mode)")
-    p.add_argument("--show", action="store_true", help="Show results in OpenCV window (video/rtsp)")
-    p.add_argument("--window-name", type=str, default="storage_violation", help="OpenCV window name")
-    p.add_argument("--wait-ms", type=int, default=1, help="cv2.waitKey delay (ms), affects UI responsiveness")
-    p.add_argument("--rtsp-reconnect-sec", type=float, default=1.0, help="Reconnect delay when RTSP read fails")
+    p.add_argument("--out-json", type=str, default=None)
+    p.add_argument("--out-image", type=str, default=None)
+    p.add_argument("--out-video", type=str, default="output.mp4")
+    p.add_argument("--output-name", type=str, default=None)
+    p.add_argument("--out-jsonl", type=str, default=None)
+    p.add_argument("--every-n-frames", type=int, default=1)
+    p.add_argument("--show", action="store_true")
+    p.add_argument("--window-name", type=str, default="storage_violation")
+    p.add_argument("--wait-ms", type=int, default=1)
+    p.add_argument("--rtsp-reconnect-sec", type=float, default=1.0)
+    p.add_argument("--max-frames", type=int, default=None)
+    p.add_argument("--duration-sec", type=float, default=None)
     return p.parse_args()
 
 
@@ -291,10 +81,13 @@ def main() -> None:
     args = parse_args()
 
     ideal_bgr = _read_bgr(args.ideal_image) if args.ideal_image else None
-    polygons = _parse_polygons(args.polygons)
+    polygons = parse_polygons_json(args.polygons)
+    ideal_storage = IdealImageStorage()
+    if ideal_bgr is not None:
+        ideal_storage.save(args.camera_id, ideal_bgr)
 
     try:
-        processor = _build_processor(
+        processor = build_processor(
             weights_path=args.weights,
             device=args.device,
             half=bool(args.half),
@@ -305,7 +98,9 @@ def main() -> None:
             max_long_side=int(args.max_long_side),
             visualization=bool(args.visualization),
             ideal_mode=str(args.ideal_mode),
-            bg_median_window=int(args.bg_median_window),
+            ideal_frames=int(
+                args.bg_median_window if args.bg_median_window is not None else args.ideal_frames
+            ),
             bg_median_update_every=int(args.bg_median_update_every),
         )
     except ModuleNotFoundError as e:
@@ -314,35 +109,47 @@ def main() -> None:
             f"Не хватает зависимости для локального запуска: {missing}\n"
             f"Установите зависимости проекта (в частности, `supervision`) и повторите запуск."
         ) from e
+
     try:
         if args.frame:
-            result = run_on_image(
+            frame_bgr = _read_bgr(args.frame)
+            payload = run_on_image(
                 processor=processor,
+                ideal_storage=ideal_storage,
                 camera_id=args.camera_id,
-                ideal_bgr=ideal_bgr,
-                frame_path=args.frame,
+                frame_bgr=frame_bgr,
+                ideal_bgr_override=ideal_bgr,
                 polygons=polygons,
-                out_json=args.out_json,
-                out_image=args.out_image,
             )
-            print(json.dumps(result, ensure_ascii=False))
+            if args.out_json:
+                Path(args.out_json).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            if args.out_image:
+                vis = draw_result(frame_bgr, payload)
+                if not cv2.imwrite(args.out_image, vis):
+                    raise RuntimeError(f"Failed to write image: {args.out_image}")
+            print(json.dumps(payload, ensure_ascii=False))
         else:
-            run_on_video(
-                processor=processor,
-                camera_id=args.camera_id,
-                ideal_bgr=ideal_bgr,
+            out_video = args.output_name or args.out_video
+            ideal = prepare_ideal_bgr(processor, ideal_storage, args.camera_id, ideal_bgr)
+            run_video_pipeline(
+                processor,
+                args.camera_id,
+                ideal,
                 video_path=args.video,
                 rtsp_url=args.rtsp,
                 polygons=polygons,
-                out_video=args.out_video,
-                out_jsonl=args.out_jsonl,
                 every_n_frames=max(1, int(args.every_n_frames)),
+                reconnect_sec=float(args.rtsp_reconnect_sec),
+                max_frames=args.max_frames,
+                duration_sec=args.duration_sec,
+                include_jsonl=args.out_jsonl is not None,
+                output_video_path=out_video,
+                output_jsonl_path=args.out_jsonl,
                 show=bool(args.show),
                 window_name=str(args.window_name),
                 wait_ms=int(args.wait_ms),
-                reconnect_sec=float(args.rtsp_reconnect_sec),
             )
-            print(f"[OK] Saved video: {args.out_video}")
+            print(f"[OK] Saved video: {out_video}")
             if args.out_jsonl:
                 print(f"[OK] Saved jsonl: {args.out_jsonl}")
     finally:
@@ -351,4 +158,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

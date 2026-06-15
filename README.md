@@ -82,14 +82,17 @@ python3 run_local.py \
 Можно не передавать `--ideal-image`, а брать фон автоматически:
 
 - **`--ideal-mode first_frame`**: фон = первый кадр (быстро, но хрупко к шуму/людям в кадре).
-- **`--ideal-mode median`**: фон = медиана по последним N кадрам (стабильнее, но тяжелее по CPU/RAM).
+- **`--ideal-mode mean`**: фон = среднее по последним N кадрам (`--ideal-frames`).
+- **`--ideal-mode median`**: фон = медиана по последним N кадрам (устойчивее к выбросам).
+
+Через API те же параметры: `POST /params` с `ideal_mode` и `ideal_frames`.
 
 Пример:
 
 ```bash
 python3 run_local.py \
-  --ideal-mode median \
-  --bg-median-window 25 \
+  --ideal-mode mean \
+  --ideal-frames 25 \
   --bg-median-update-every 5 \
   --video data/video1.avi \
   --out-video out.mp4

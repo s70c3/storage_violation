@@ -4,6 +4,8 @@ import json
 import os
 import requests
 
+from source.runner_common import draw_result
+
 
 DEFAULT_API_URL = "http://127.0.0.1:8000"
 DEFAULT_CAMERA_ID = "cam_1"
@@ -82,67 +84,6 @@ def send_frame(
     )
     resp.raise_for_status()
     return resp.json()
-
-
-def draw_result(frame_bgr, result: dict):
-    vis = frame_bgr.copy()
-
-    status = bool(result.get("status", False))
-    detected = bool(result.get("detected", False))
-    debug = result.get("debug", {})
-
-    candidate_boxes = result.get("candidate_boxes", [])
-    reported_boxes = result.get("reported_boxes", [])
-
-    for box in candidate_boxes:
-        x1, y1, x2, y2 = map(int, box)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(
-            vis,
-            "candidate",
-            (x1, max(20, y1 - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA,
-        )
-
-    for box in reported_boxes:
-        x1, y1, x2, y2 = map(int, box)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 255), 3)
-        cv2.putText(
-            vis,
-            "reported",
-            (x1, max(20, y1 - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-    text1 = (
-        f"detected={detected} status={status} "
-        f"cand={len(candidate_boxes)} reported={len(reported_boxes)}"
-    )
-    text2 = (
-        f"n_inst={debug.get('n_instances', 0)} "
-        f"cand_dbg={debug.get('candidate_len', 0)} "
-        f"rep_dbg={debug.get('reported_len', 0)} "
-        f"alpha={debug.get('alpha_used', 0):.4f}"
-    )
-
-    cv2.putText(
-        vis, text1, (20, 30),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA
-    )
-    cv2.putText(
-        vis, text2, (20, 65),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2, cv2.LINE_AA
-    )
-
-    return vis
 
 
 def main():
