@@ -118,6 +118,17 @@ curl -fL "http://localhost:28001/demo/process_data_video?duration_sec=10&preset=
 # офис small (preset 3), весь файл
 curl -fL "http://localhost:28001/demo/process_data_video?duration_sec=-1&preset=3" -o demo_small.mp4
 
+# без ideal-файла: фон из первого кадра видео
+curl -fL "http://localhost:28001/demo/process_data_video?preset=1&ideal_mode=first_frame&duration_sec=10" -o demo_no_ideal.mp4
+
+# медиана по 25 кадрам, только video из каталога демо
+curl -fG "http://localhost:28001/demo/process_data_video_by_names" \
+  --data-urlencode "video_name=ofis_small.mp4" \
+  --data-urlencode "ideal_mode=median" \
+  --data-urlencode "ideal_frames=25" \
+  --data-urlencode "duration_sec=10" \
+  -o demo_median.mp4
+
 # свои имена файлов в каталоге демо (без путей, только basename)
 curl -fG "http://localhost:28001/demo/process_data_video_by_names" \
   --data-urlencode "ideal_name=ofis_small.png" \
@@ -128,4 +139,5 @@ curl -fG "http://localhost:28001/demo/process_data_video_by_names" \
 
 - **`duration_sec`**: положительное число — секунд с начала; **`-1`** — весь ролик до EOF (без лимита по длине).
 - **`preset`**: `1` … `4` — см. таблицу.
-- **`/demo/process_data_video_by_names`**: параметры `ideal_name` и `video_name` — любые файлы из каталога демо (буквы, цифры, `.` `_` `-`).
+- **`ideal_mode`**, **`ideal_frames`**, **`bg_median_update_every`**: как в `POST /params`; при `first_frame` / `median` / `mean` ideal-файл не нужен.
+- **`/demo/process_data_video_by_names`**: `video_name` обязателен; `ideal_name` — только при `ideal_mode=static` (по умолчанию).
