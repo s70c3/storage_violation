@@ -41,6 +41,63 @@ http://localhost:8000/docs
 
 ``` python3 process_video.py --ideal-image data/ofis_big.png --video data/ofis_big.mp4```
 
+## Локальный запуск (без API)
+
+Скрипт `run_local.py` запускает тот же пайплайн напрямую (без FastAPI).
+
+- Прогон одного изображения:
+
+```bash
+python3 run_local.py \
+  --ideal-image data/ideal.png \
+  --frame data/frame.jpg \
+  --out-image out.jpg \
+  --out-json out.json
+```
+
+- Прогон видео:
+
+```bash
+python3 run_local.py \
+  --ideal-image data/ideal.png \
+  --video data/video1.avi \
+  --out-video out.mp4 \
+  --out-jsonl out.jsonl
+```
+
+### RTSP + показ в окне OpenCV
+
+```bash
+python3 run_local.py \
+  --rtsp "rtsp://user:pass@host:554/stream" \
+  --ideal-mode median \
+  --show \
+  --out-video out.mp4
+```
+
+- **Выход**: нажмите `q` или `Esc` в окне.
+
+### Фон (идеальное изображение) без загрузки ideal
+
+Можно не передавать `--ideal-image`, а брать фон автоматически:
+
+- **`--ideal-mode first_frame`**: фон = первый кадр (быстро, но хрупко к шуму/людям в кадре).
+- **`--ideal-mode mean`**: фон = среднее по последним N кадрам (`--ideal-frames`).
+- **`--ideal-mode median`**: фон = медиана по последним N кадрам (устойчивее к выбросам).
+
+Через API те же параметры: `POST /params` с `ideal_mode` и `ideal_frames`.
+
+Пример:
+
+```bash
+python3 run_local.py \
+  --ideal-mode mean \
+  --ideal-frames 25 \
+  --bg-median-update-every 5 \
+  --video data/video1.avi \
+  --out-video out.mp4
+```
+
 ## Демо через API (без клиента)
 
 В `./data` (в контейнере монтируется в `/app/data`; путь задан константой `DATA_DIR` в `source/demo_pipeline.py`) должны лежать файлы для выбранного пресета:

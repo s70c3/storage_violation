@@ -4,7 +4,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
 import cv2
 import numpy as np
@@ -20,10 +20,13 @@ class CameraEMAState:
     empty_rgb01: np.ndarray
     recent_rgb01: np.ndarray
     last_ts_mono: float
-    last_detect_mono: float
     detect_started: bool = False
     recent_frame_i: int = 0
     recent_dt_accum: float = 0.0
+    bg_frame_i: int = 0
+    bg_u8_ring: Optional[List[np.ndarray]] = None
+    bg_u8_ring_pos: int = 0
+    bg_sum_f32: Optional[np.ndarray] = None
 
 
 class StorageViolationFrameProcessor:
@@ -44,11 +47,13 @@ class StorageViolationFrameProcessor:
     def __init__(
         self,
         cd_segmentator: SemanticSegmentatorProtocol,
-        delta: int = 2,
+        ideal_mode: Literal["static", "first_frame", "median", "mean"] = "static",
+        ideal_frames: int = 25,
+        bg_median_window: int | None = None,
+        bg_median_update_every: int = 5,
         ema_tau_sec: float = 5.0,
         ema_min_alpha: float = 0.02,
         ema_max_alpha: float = 0.12,
-        min_empty_weight: float = 0.20,
         thr: float = 0.5,
         min_side: int = 100,
         morph_ksize: int = 3,
@@ -66,7 +71,16 @@ class StorageViolationFrameProcessor:
         visualization: bool = False,
     ):
         self.cd_segmentator = cd_segmentator
-        self.delta = int(delta)
+        self.ideal_mode = str(ideal_mode)
+        if self.ideal_mode not in ("static", "first_frame", "median", "mean"):
+            raise ValueError(
+                f"ideal_mode must be one of: static, first_frame, median, mean; got {ideal_mode}"
+            )
+
+        if bg_median_window is not None:
+            ideal_frames = int(bg_median_window)
+        self.ideal_frames = max(1, int(ideal_frames))
+        self.bg_median_update_every = max(1, int(bg_median_update_every))
 
         self.camera_state: Dict[str, CameraEMAState] = {}
         self.tracker_by_camera: Dict[str, ByteTrackStationaryTracker] = {}
@@ -74,8 +88,6 @@ class StorageViolationFrameProcessor:
         self.ema_tau_sec = float(ema_tau_sec)
         self.ema_min_alpha = float(ema_min_alpha)
         self.ema_max_alpha = float(ema_max_alpha)
-
-        self.min_empty_weight = float(min_empty_weight)
 
         self.thr = float(thr)
         self.min_side = int(min_side)
@@ -105,35 +117,130 @@ class StorageViolationFrameProcessor:
 
         self.visualization = visualization
 
+    def _reset_all_camera_states(self, reason: str) -> None:
+        self.camera_state.clear()
+        self.tracker_by_camera.clear()
+        self._rt_iter_by_camera.clear()
+        self._prepared_empty_cache.clear()
+        self._logger.info(f"[PARAM_UPDATE] camera states reset: {reason}")
+
     def update_runtime_params(
         self,
         min_side: int | None = None,
         stationary_time_sec: float | None = None,
         max_long_side: int | None = None,
+        ideal_mode: str | None = None,
+        ideal_frames: int | None = None,
+        bg_median_window: int | None = None,
+        bg_median_update_every: int | None = None,
+        thr: float | None = None,
+        morph_ksize: int | None = None,
+        ema_tau_sec: float | None = None,
+        ema_min_alpha: float | None = None,
+        ema_max_alpha: float | None = None,
+        recent_update_every: int | None = None,
+        visualization: bool | None = None,
+        tracker_track_activation_threshold: float | None = None,
+        tracker_lost_track_buffer: int | None = None,
+        tracker_minimum_matching_threshold: float | None = None,
+        tracker_frame_rate: int | None = None,
+        tracker_minimum_consecutive_frames: int | None = None,
+        tracker_max_center_shift_px: float | None = None,
+        tracker_max_center_shift_norm: float | None = None,
     ) -> None:
+        reset_states = False
+        reset_trackers = False
+
         if min_side is not None:
             self.min_side = int(min_side)
 
+        if thr is not None:
+            self.thr = float(thr)
+
+        if morph_ksize is not None:
+            self.morph_ksize = int(morph_ksize)
+
+        if ema_tau_sec is not None:
+            self.ema_tau_sec = float(ema_tau_sec)
+
+        if ema_min_alpha is not None:
+            self.ema_min_alpha = float(ema_min_alpha)
+
+        if ema_max_alpha is not None:
+            self.ema_max_alpha = float(ema_max_alpha)
+
+        if recent_update_every is not None:
+            self.recent_update_every = max(1, int(recent_update_every))
+
+        if visualization is not None:
+            self.visualization = bool(visualization)
+
+        tracker_fields = (
+            ("tracker_track_activation_threshold", tracker_track_activation_threshold, float),
+            ("tracker_lost_track_buffer", tracker_lost_track_buffer, int),
+            ("tracker_minimum_matching_threshold", tracker_minimum_matching_threshold, float),
+            ("tracker_frame_rate", tracker_frame_rate, int),
+            ("tracker_minimum_consecutive_frames", tracker_minimum_consecutive_frames, int),
+            ("tracker_max_center_shift_px", tracker_max_center_shift_px, float),
+            ("tracker_max_center_shift_norm", tracker_max_center_shift_norm, float),
+        )
+        for attr, val, cast in tracker_fields:
+            if val is not None:
+                new_val = cast(val)
+                if getattr(self, attr) != new_val:
+                    setattr(self, attr, new_val)
+                    reset_trackers = True
+
         if stationary_time_sec is not None:
-            self.stationary_time_sec = float(stationary_time_sec)
+            new_stationary = float(stationary_time_sec)
+            if new_stationary != self.stationary_time_sec:
+                self.stationary_time_sec = new_stationary
+                reset_trackers = True
+
+        if ideal_mode is not None:
+            mode = str(ideal_mode)
+            if mode not in ("static", "first_frame", "median", "mean"):
+                raise ValueError(
+                    f"ideal_mode must be one of: static, first_frame, median, mean; got {ideal_mode}"
+                )
+            if mode != self.ideal_mode:
+                self.ideal_mode = mode
+                reset_states = True
+
+        frames = ideal_frames if ideal_frames is not None else bg_median_window
+        if frames is not None:
+            new_window = max(1, int(frames))
+            if new_window != self.ideal_frames:
+                self.ideal_frames = new_window
+                reset_states = True
+
+        if bg_median_update_every is not None:
+            self.bg_median_update_every = max(1, int(bg_median_update_every))
 
         if max_long_side is not None:
-            self.max_long_side = int(max_long_side)
-            self.camera_state.clear()
-            self.tracker_by_camera.clear()
-            self._rt_iter_by_camera.clear()
-            self._prepared_empty_cache.clear()
-            self._logger.info("[PARAM_UPDATE] camera states reset because max_long_side changed")
+            new_max = int(max_long_side)
+            if new_max != self.max_long_side:
+                self.max_long_side = new_max
+                reset_states = True
+
+        if reset_states:
+            self._reset_all_camera_states("runtime params changed")
+            reset_trackers = True
 
         self._logger.info(
-            f"[PARAM_UPDATE] min_side={self.min_side} "
+            f"[PARAM_UPDATE] min_side={self.min_side} thr={self.thr} "
             f"stationary_time_sec={self.stationary_time_sec} "
-            f"max_long_side={self.max_long_side}"
+            f"max_long_side={self.max_long_side} "
+            f"ideal_mode={self.ideal_mode} "
+            f"ideal_frames={self.ideal_frames} "
+            f"bg_median_update_every={self.bg_median_update_every} "
+            f"visualization={self.visualization}"
         )
 
-        for camera_id in list(self.tracker_by_camera.keys()):
-            self.tracker_by_camera[camera_id] = self._make_tracker()
-            self._logger.info(f"[PARAM_UPDATE] tracker reset for camera={camera_id}")
+        if reset_trackers:
+            for camera_id in list(self.tracker_by_camera.keys()):
+                self.tracker_by_camera[camera_id] = self._make_tracker()
+                self._logger.info(f"[PARAM_UPDATE] tracker reset for camera={camera_id}")
 
     def load(self) -> None:
         self.cd_segmentator.load()
@@ -173,12 +280,6 @@ class StorageViolationFrameProcessor:
         if camera_id not in self.tracker_by_camera:
             self.tracker_by_camera[camera_id] = self._make_tracker()
             self._logger.info(f"[INIT] tracker created for camera={camera_id}")
-
-    def _should_detect(self, st: CameraEMAState, now_mono: float) -> bool:
-        if (now_mono - st.last_detect_mono) >= float(self.delta):
-            st.last_detect_mono = now_mono
-            return True
-        return False
 
     def _ema_alpha(self, dt: float) -> float:
         if self.ema_tau_sec <= 1e-6:
@@ -437,27 +538,93 @@ class StorageViolationFrameProcessor:
         self._prepared_empty_cache[cache_key] = empty_rgb01
         return empty_rgb01
 
+    @staticmethod
+    def _rgb01_to_u8(rgb01: np.ndarray) -> np.ndarray:
+        x = np.clip(rgb01 * 255.0, 0.0, 255.0).astype(np.uint8)
+        return np.ascontiguousarray(x)
+
+    def _bg_update_from_frame(self, st: CameraEMAState, cur_rgb01: np.ndarray) -> None:
+        """
+        Updates st.empty_rgb01 (background reference) for modes:
+        - first_frame: set once on first seen frame
+        - median: rolling per-pixel median over last N frames
+        - mean: rolling per-pixel mean over last N frames (incremental sum, O(HW))
+        """
+        if self.ideal_mode == "static":
+            return
+
+        st.bg_frame_i += 1
+        cur_u8 = self._rgb01_to_u8(cur_rgb01)
+
+        if self.ideal_mode == "first_frame":
+            if st.bg_u8_ring is None:
+                st.bg_u8_ring = [cur_u8]
+                st.empty_rgb01 = cur_u8.astype(np.float32) / 255.0
+            return
+
+        if self.ideal_mode not in ("median", "mean"):
+            return
+
+        n = self.ideal_frames
+        cur_f32 = cur_u8.astype(np.float32, copy=False)
+
+        if st.bg_u8_ring is None:
+            st.bg_u8_ring = [cur_u8.copy() for _ in range(n)]
+            st.bg_u8_ring_pos = 0
+            st.bg_sum_f32 = cur_f32 * float(n)
+        else:
+            old_u8 = st.bg_u8_ring[st.bg_u8_ring_pos]
+            if self.ideal_mode == "mean":
+                if st.bg_sum_f32 is None:
+                    st.bg_sum_f32 = np.sum(
+                        np.stack(st.bg_u8_ring, axis=0, dtype=np.float32),
+                        axis=0,
+                    )
+                else:
+                    st.bg_sum_f32 += cur_f32
+                    st.bg_sum_f32 -= old_u8.astype(np.float32, copy=False)
+            st.bg_u8_ring[st.bg_u8_ring_pos] = cur_u8
+            st.bg_u8_ring_pos = (st.bg_u8_ring_pos + 1) % n
+
+        if (st.bg_frame_i % self.bg_median_update_every) != 0:
+            return
+
+        if self.ideal_mode == "mean":
+            if st.bg_sum_f32 is None:
+                return
+            st.empty_rgb01 = (st.bg_sum_f32 / float(n)) * (1.0 / 255.0)
+            return
+
+        stack = np.stack(st.bg_u8_ring, axis=0)
+        bg_u8 = np.median(stack, axis=0).astype(np.uint8)
+        st.empty_rgb01 = bg_u8.astype(np.float32) / 255.0
+
     def _init_camera_state_if_needed(
         self,
         camera_id: str,
         frame_hw: Tuple[int, int],
-        ideal_bgr: np.ndarray,
+        ideal_bgr: Optional[np.ndarray],
         now_mono: float,
     ) -> None:
         if camera_id in self.camera_state:
             return
 
-        empty_rgb01 = self._prepare_empty_rgb01(
-            camera_id=camera_id,
-            ideal_bgr=ideal_bgr,
-            target_hw=frame_hw,
-        )
+        if self.ideal_mode == "static":
+            if ideal_bgr is None:
+                raise ValueError("ideal_bgr is None (ideal_mode=static)")
+            empty_rgb01 = self._prepare_empty_rgb01(
+                camera_id=camera_id,
+                ideal_bgr=ideal_bgr,
+                target_hw=frame_hw,
+            )
+        else:
+            # Placeholder; will be overwritten from the first frame in _bg_update_from_frame
+            empty_rgb01 = np.zeros((frame_hw[0], frame_hw[1], 3), dtype=np.float32)
 
         self.camera_state[camera_id] = CameraEMAState(
             empty_rgb01=empty_rgb01,
             recent_rgb01=empty_rgb01.copy(),
             last_ts_mono=now_mono,
-            last_detect_mono=now_mono - float(self.delta),
             detect_started=False,
             recent_frame_i=0,
             recent_dt_accum=0.0,
@@ -470,23 +637,11 @@ class StorageViolationFrameProcessor:
         self,
         camera_id: str,
         frame_hw: Tuple[int, int],
-        ideal_bgr: np.ndarray,
+        ideal_bgr: Optional[np.ndarray],
         now_mono: float,
     ) -> None:
         self._init_camera_state_if_needed(camera_id, frame_hw, ideal_bgr, now_mono)
         self._ensure_camera_tracker(camera_id)
-
-    def gamma_rgb01(self, x: np.ndarray, gamma: float = 0.8) -> np.ndarray:
-        x = np.clip(x, 0.0, 1.0)
-        return np.power(x, gamma).astype(np.float32)
-
-    @staticmethod
-    def _blur_rgb01(rgb01: np.ndarray, ksize: int = 5) -> np.ndarray:
-        if rgb01 is None or ksize <= 1:
-            return rgb01
-        if (ksize % 2) == 0:
-            ksize += 1
-        return cv2.GaussianBlur(rgb01, (ksize, ksize), 0)
 
     @staticmethod
     def _ms(t0: float, t1: float) -> float:
@@ -496,7 +651,7 @@ class StorageViolationFrameProcessor:
         self,
         camera_id: str,
         frame_bgr: np.ndarray,
-        ideal_bgr: np.ndarray,
+        ideal_bgr: Optional[np.ndarray],
         polygons: Optional[List[np.ndarray]] = None,
         now_mono: Optional[float] = None,
         frame_obj: Any = None,
@@ -505,8 +660,8 @@ class StorageViolationFrameProcessor:
 
         if frame_bgr is None:
             raise ValueError("frame_bgr is None")
-        if ideal_bgr is None:
-            raise ValueError("ideal_bgr is None")
+        if self.ideal_mode == "static" and ideal_bgr is None:
+            raise ValueError("ideal_bgr is None (ideal_mode=static)")
 
         orig_h, orig_w = frame_bgr.shape[:2]
 
@@ -524,8 +679,10 @@ class StorageViolationFrameProcessor:
         h, w = cur_bgr.shape[:2]
 
         if resize_scale != 1.0:
-            ideal_bgr_resized = cv2.resize(ideal_bgr, (w, h), interpolation=cv2.INTER_AREA)
-            ideal_bgr_resized = np.ascontiguousarray(ideal_bgr_resized)
+            ideal_bgr_resized: Optional[np.ndarray] = None
+            if ideal_bgr is not None:
+                ideal_bgr_resized = cv2.resize(ideal_bgr, (w, h), interpolation=cv2.INTER_AREA)
+                ideal_bgr_resized = np.ascontiguousarray(ideal_bgr_resized)
 
             polygons_resized = None
             if polygons is not None:
@@ -544,7 +701,7 @@ class StorageViolationFrameProcessor:
                     ]
                     raw_humans.boxes = scaled_boxes
         else:
-            ideal_bgr_resized = np.ascontiguousarray(ideal_bgr)
+            ideal_bgr_resized = np.ascontiguousarray(ideal_bgr) if ideal_bgr is not None else None
             polygons_resized = polygons
 
         cur_rgb01 = self._bgr_u8_to_rgb01(cur_bgr)
@@ -574,73 +731,13 @@ class StorageViolationFrameProcessor:
         timings_ms["update_recent"] = self._ms(t0, t1)
 
         t0 = time.perf_counter()
-        should_detect = self._should_detect(st, now_mono)
+        self._bg_update_from_frame(st=st, cur_rgb01=cur_rgb01)
         t1 = time.perf_counter()
-        timings_ms["delta_gate"] = self._ms(t0, t1)
+        timings_ms["bg_update"] = self._ms(t0, t1)
 
-        if not should_detect:
-            t_total_1 = time.perf_counter()
-            timings_ms["total"] = self._ms(t_total_0, t_total_1)
-
-            self._logger.info(
-                f"[TIMING] camera={camera_id} "
-                f"total={timings_ms['total']:.3f}ms "
-                f"resize_prepare={timings_ms['resize_prepare']:.3f} "
-                f"init={timings_ms['init']:.3f} "
-                f"zone_mask={timings_ms['zone_mask']:.3f} "
-                f"update_recent={timings_ms['update_recent']:.3f} "
-                f"delta_gate={timings_ms['delta_gate']:.3f} "
-                f"skipped_by_delta=1"
-            )
-
-            return {
-                "detected": False,
-                "status": False,
-                "boxes": np.empty((0, 4), dtype=np.int32),
-                "candidate_boxes": np.empty((0, 4), dtype=np.int32),
-                "pending_candidate_boxes": np.empty((0, 4), dtype=np.int32),
-                "reported_boxes": np.empty((0, 4), dtype=np.int32),
-                "candidate_track_ids": [],
-                "reported_track_ids": [],
-                "instance_masks": [],
-                "cd_mask01": None,
-                "fused_mask01": None,
-                "debug": {
-                    "camera_id": camera_id,
-                    "alpha_used": alpha_used,
-                    "detect_started": st.detect_started,
-                    "n_instances": 0,
-                    "candidate_len": 0,
-                    "reported_len": 0,
-                    "skipped_by_delta": True,
-                    "resize_scale": resize_scale,
-                    "processed_hw": [h, w],
-                    "original_hw": [orig_h, orig_w],
-                    "timings_ms": timings_ms,
-                },
-            }
-
-        t0 = time.perf_counter()
-        recent_rgb01_for_cd = (
-            (1.0 - self.min_empty_weight) * st.recent_rgb01
-            + self.min_empty_weight * st.empty_rgb01
-        )
-
-        # empty_rgb01 = self.gamma_rgb01(st.empty_rgb01, 0.8)
-        empty_rgb01 = self._blur_rgb01(st.empty_rgb01, ksize=3)
-
-        # recent_rgb01_for_cd = self.gamma_rgb01(recent_rgb01_for_cd, 0.8)
-        blur_size = max(3, (recent_rgb01_for_cd.shape[1] // 40) | 1)
-        recent_blur = self._blur_rgb01(recent_rgb01_for_cd, ksize=blur_size)
-        recent_rgb01_for_cd = (
-            (1.0 - self.min_empty_weight) * recent_blur
-            + self.min_empty_weight * st.empty_rgb01
-        )
-
-        # cur_rgb01_proc = self.gamma_rgb01(cur_rgb01, 0.8)
-        cur_rgb01_proc = self._blur_rgb01(cur_rgb01, ksize=3)
-        t1 = time.perf_counter()
-        timings_ms["preprocess_cd_inputs"] = self._ms(t0, t1)
+        empty_rgb01 = st.empty_rgb01
+        recent_rgb01_for_cd = st.recent_rgb01
+        cur_rgb01_proc = cur_rgb01
 
         t0 = time.perf_counter()
         cd_mask01 = self._infer_cd_mask01(
@@ -729,8 +826,7 @@ class StorageViolationFrameProcessor:
             f"init={timings_ms['init']:.3f} "
             f"zone_mask={timings_ms['zone_mask']:.3f} "
             f"update_recent={timings_ms['update_recent']:.3f} "
-            f"delta_gate={timings_ms['delta_gate']:.3f} "
-            f"preprocess_cd_inputs={timings_ms['preprocess_cd_inputs']:.3f} "
+            f"bg_update={timings_ms['bg_update']:.3f} "
             f"infer_cd={timings_ms['infer_cd']:.3f} "
             f"fuse={timings_ms['fuse']:.3f} "
             f"postprocess_instances={timings_ms['postprocess_instances']:.3f} "
@@ -756,7 +852,6 @@ class StorageViolationFrameProcessor:
                 "current_frame_boxes_len": len(current_bboxes),
                 "candidate_len": len(candidate_boxes),
                 "reported_len": len(reported_boxes),
-                "skipped_by_delta": False,
                 "resize_scale": resize_scale,
                 "processed_hw": [h, w],
                 "original_hw": [orig_h, orig_w],
