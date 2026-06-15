@@ -4,7 +4,7 @@ import logging
 import os
 import tempfile
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
@@ -12,7 +12,12 @@ from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
-from .demo_pipeline import run_demo_video, run_demo_video_named, sanitize_data_filename
+from .demo_pipeline import (
+    run_demo_video,
+    run_demo_video_named,
+    sanitize_data_filename,
+    temporary_ideal_params,
+)
 from .ideal_storage import IdealImageStorage
 from .processor import StorageViolationFrameProcessor
 from .runner_common import (
@@ -400,18 +405,32 @@ async def demo_process_data_video(
     duration_sec: float = Query(10.0, ge=-1.0),
     preset: int = Query(1, ge=1, le=4),
     output_name: str = Query("demo_output.mp4", min_length=1, max_length=255),
+    ideal_mode: Optional[Literal["static", "first_frame", "median", "mean"]] = Query(
+        None,
+        description="Режим фона; без static ideal-файл из пресета не нужен",
+    ),
+    ideal_frames: Optional[int] = Query(None, ge=1, description="Окно для median/mean"),
+    bg_median_update_every: Optional[int] = Query(None, ge=1),
 ):
     processor: StorageViolationFrameProcessor = app.state.processor
     ideal_storage: IdealImageStorage = app.state.ideal_storage
 
-    try:
-        out_path = await run_in_threadpool(
-            run_demo_video,
+    def _run() -> str:
+        with temporary_ideal_params(
             processor,
-            ideal_storage,
-            duration_sec,
-            preset,
-        )
+            ideal_mode=ideal_mode,
+            ideal_frames=ideal_frames,
+            bg_median_update_every=bg_median_update_every,
+        ):
+            return run_demo_video(
+                processor,
+                ideal_storage,
+                duration_sec,
+                preset,
+            )
+
+    try:
+        out_path = await run_in_threadpool(_run)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except ValueError as e:
@@ -435,23 +454,49 @@ async def demo_process_data_video(
 
 @app.get("/demo/process_data_video_by_names", summary="Демо: свои имена ideal и video → MP4")
 async def demo_process_data_video_by_names(
-    ideal_name: str = Query(..., min_length=1, max_length=255),
     video_name: str = Query(..., min_length=1, max_length=255),
+    ideal_name: Optional[str] = Query(
+        None,
+        min_length=1,
+        max_length=255,
+        description="Обязателен при ideal_mode=static (по умолчанию)",
+    ),
     duration_sec: float = Query(10.0, ge=-1.0),
     output_name: str = Query("demo_output.mp4", min_length=1, max_length=255),
+    ideal_mode: Optional[Literal["static", "first_frame", "median", "mean"]] = Query(
+        None,
+        description="Режим фона; без static ideal_name не нужен",
+    ),
+    ideal_frames: Optional[int] = Query(None, ge=1, description="Окно для median/mean"),
+    bg_median_update_every: Optional[int] = Query(None, ge=1),
 ):
     processor: StorageViolationFrameProcessor = app.state.processor
     ideal_storage: IdealImageStorage = app.state.ideal_storage
 
-    try:
-        out_path = await run_in_threadpool(
-            run_demo_video_named,
-            processor,
-            ideal_storage,
-            duration_sec,
-            ideal_name,
-            video_name,
+    effective_mode = ideal_mode if ideal_mode is not None else processor.ideal_mode
+    if effective_mode == "static" and ideal_name is None:
+        raise HTTPException(
+            status_code=400,
+            detail="ideal_name is required when ideal_mode is static",
         )
+
+    def _run() -> str:
+        with temporary_ideal_params(
+            processor,
+            ideal_mode=ideal_mode,
+            ideal_frames=ideal_frames,
+            bg_median_update_every=bg_median_update_every,
+        ):
+            return run_demo_video_named(
+                processor,
+                ideal_storage,
+                duration_sec,
+                video_name,
+                ideal_name=ideal_name,
+            )
+
+    try:
+        out_path = await run_in_threadpool(_run)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except ValueError as e:

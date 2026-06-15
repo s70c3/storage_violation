@@ -9,7 +9,8 @@ import logging
 import os
 import re
 import tempfile
-from typing import Any
+from contextlib import contextmanager
+from typing import Iterator, Literal, Optional
 
 import cv2
 
@@ -29,6 +30,37 @@ DEMO_PRESETS: dict[int, tuple[str, str]] = {
 
 _SAFE_FILENAME = re.compile(r"^[a-zA-Z0-9._-]+$")
 DEMO_CAMERA_ID = "demo_data"
+
+IdealMode = Literal["static", "first_frame", "median", "mean"]
+
+
+@contextmanager
+def temporary_ideal_params(
+    processor: StorageViolationFrameProcessor,
+    *,
+    ideal_mode: Optional[IdealMode] = None,
+    ideal_frames: Optional[int] = None,
+    bg_median_update_every: Optional[int] = None,
+) -> Iterator[None]:
+    """Временно меняет параметры фона на время демо-прогона."""
+    if ideal_mode is None and ideal_frames is None and bg_median_update_every is None:
+        yield
+        return
+
+    saved = {
+        "ideal_mode": processor.ideal_mode,
+        "ideal_frames": processor.ideal_frames,
+        "bg_median_update_every": processor.bg_median_update_every,
+    }
+    processor.update_runtime_params(
+        ideal_mode=ideal_mode,
+        ideal_frames=ideal_frames,
+        bg_median_update_every=bg_median_update_every,
+    )
+    try:
+        yield
+    finally:
+        processor.update_runtime_params(**saved)
 
 
 def sanitize_data_filename(name: str) -> str:
@@ -50,22 +82,27 @@ def run_demo_video_files(
     processor: StorageViolationFrameProcessor,
     ideal_storage: IdealImageStorage,
     duration_sec: float,
-    ideal_path: str,
     video_path: str,
     log_label: str,
+    ideal_path: str | None = None,
 ) -> str:
     """
-    Читает ideal_path / video_path, пишет MP4 во временный файл.
+    Читает video_path, пишет MP4 во временный файл.
+    При ideal_mode=static нужен ideal_path; иначе фон строится из кадров видео.
     duration_sec == -1 — весь ролик до EOF.
     """
-    if not os.path.isfile(ideal_path):
-        raise FileNotFoundError(f"Missing ideal image: {ideal_path}")
     if not os.path.isfile(video_path):
         raise FileNotFoundError(f"Missing video: {video_path}")
 
-    ideal_bgr = cv2.imread(ideal_path, cv2.IMREAD_COLOR)
-    if ideal_bgr is None:
-        raise ValueError(f"Failed to decode ideal image: {ideal_path}")
+    ideal_bgr = None
+    if processor.ideal_mode == "static":
+        if ideal_path is None:
+            raise ValueError("ideal_path is required when ideal_mode=static")
+        if not os.path.isfile(ideal_path):
+            raise FileNotFoundError(f"Missing ideal image: {ideal_path}")
+        ideal_bgr = cv2.imread(ideal_path, cv2.IMREAD_COLOR)
+        if ideal_bgr is None:
+            raise ValueError(f"Failed to decode ideal image: {ideal_path}")
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -115,13 +152,18 @@ def run_demo_video(
 
     base = data_dir or DATA_DIR
     ideal_name, video_name = DEMO_PRESETS[preset]
+    ideal_path = os.path.join(base, ideal_name) if processor.ideal_mode == "static" else None
+    if processor.ideal_mode == "static":
+        label = f"preset={preset} ({ideal_name}+{video_name})"
+    else:
+        label = f"preset={preset} ({video_name}, ideal_mode={processor.ideal_mode})"
     return run_demo_video_files(
         processor,
         ideal_storage,
         duration_sec,
-        os.path.join(base, ideal_name),
         os.path.join(base, video_name),
-        log_label=f"preset={preset} ({ideal_name}+{video_name})",
+        log_label=label,
+        ideal_path=ideal_path,
     )
 
 
@@ -129,18 +171,26 @@ def run_demo_video_named(
     processor: StorageViolationFrameProcessor,
     ideal_storage: IdealImageStorage,
     duration_sec: float,
-    ideal_name: str,
     video_name: str,
+    ideal_name: str | None = None,
     data_dir: str | None = None,
 ) -> str:
-    in_ideal = sanitize_data_filename(ideal_name)
     in_video = sanitize_data_filename(video_name)
     base = data_dir or DATA_DIR
+    ideal_path = None
+    if processor.ideal_mode == "static":
+        if ideal_name is None:
+            raise ValueError("ideal_name is required when ideal_mode=static")
+        in_ideal = sanitize_data_filename(ideal_name)
+        ideal_path = os.path.join(base, in_ideal)
+        label = f"custom ideal={in_ideal} video={in_video}"
+    else:
+        label = f"custom video={in_video} ideal_mode={processor.ideal_mode}"
     return run_demo_video_files(
         processor,
         ideal_storage,
         duration_sec,
-        os.path.join(base, in_ideal),
         os.path.join(base, in_video),
-        log_label=f"custom ideal={in_ideal} video={in_video}",
+        log_label=label,
+        ideal_path=ideal_path,
     )
